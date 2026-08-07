@@ -65,6 +65,7 @@ def tilelang_prepare_h_2(
         h0: T.Tensor(h0_shape, dtype=ht_dtype),
         h: T.Tensor(h_shape, dtype=h_dtype),
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
+        r: T.Tensor(v_shape, dtype=qkva_dtype),
     ):
         with T.Kernel(batch_size * H, threads=256) as (bbh,):
             bb, bh = bbh // H, bbh % H
@@ -127,9 +128,12 @@ def tilelang_prepare_h_2(
                     )
                 T.copy(u_fragment, ymu_shared)
 
-                # R = A @ (mv - U)
+                # R = A @ (mv - U); stored for the fused_fwd stage.
                 T.gemm(a_shared, ymu_shared, r_fragment, clear_accum=True)
                 T.copy(r_fragment, r_shared)
+                for j_s, j_v in T.Parallel(block_S, DV):
+                    if left + j_s < num_tokens:
+                        r[bb, left + j_s, bh, j_v] = r_shared[j_s, j_v]
 
                 # S = g_end * S  (per KEY row), then S += k_to_end^T @ R
                 for j_k, j_v in T.Parallel(DK, DV):
@@ -186,6 +190,9 @@ def prepare_h_2(
     ht = torch.empty(
         (batch_size, H, K, V), dtype=torch.float32, device=ekb.device
     )
+    r = torch.empty(
+        (batch_size, num_tokens, H, V), dtype=ekb.dtype, device=ekb.device
+    )
 
     kernel = tilelang_prepare_h_2(
         H,
@@ -201,10 +208,10 @@ def prepare_h_2(
         store_final_state=output_final_state,
         store_h=output_h,
     )
-    kernel(ekb, kte, mv, a, g_end_exp, initial_state, h, ht)
+    kernel(ekb, kte, mv, a, g_end_exp, initial_state, h, ht, r)
 
     if not output_final_state:
         ht = None
     if not output_h:
         h = None
-    return h, ht
+    return h, ht, r

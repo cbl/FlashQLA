@@ -160,19 +160,114 @@ def test_kkt_solve_2_matches_ref(B, T, Hk, Hv):
     assert _rel(a_kernel[:, :T], t_ref) < RTOL
 
 
-@pytest.mark.skip(reason="M2: prepare_h_2 not yet implemented")
-def test_prepare_h_2_matches_ref():
-    pass
+@pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
+@pytest.mark.parametrize("use_h0", [False, True])
+def test_prepare_h_2_matches_ref(B, T, Hk, Hv, use_h0):
+    try:
+        from flash_qla.ops.gated_delta_rule_2.chunk import (
+            CHUNK_SIZE_2, kkt_solve, prepare_h_2, prepare_inputs_2,
+        )
+    except Exception as e:
+        pytest.skip(f"flash_qla unavailable here ({type(e).__name__})")
+    if prepare_h_2 is None:
+        pytest.skip("gdn2 prepare_h_2: not built for this arch yet")
+
+    from ref_gdr2 import chunk_gdn2_fwd_ref
+
+    q, k, v, g, b, w, h0 = _make_inputs_2(B, T, Hk, Hv)
+    chunk = CHUNK_SIZE_2
+    k_bf, v_bf = k.to(torch.bfloat16), v.to(torch.bfloat16)
+    b_bf, w_bf = b.to(torch.bfloat16), w.to(torch.bfloat16)
+    g32 = g.float()
+    h0_arg = h0.float() if use_h0 else None
+
+    g_cs, ekb, kte, mv, gend = prepare_inputs_2(k_bf, v_bf, g32, b_bf, w_bf, chunk)
+    a = kkt_solve(k_bf, g_cs, b_bf, chunk_size=chunk)
+    h_kernel, ht_kernel, _ = prepare_h_2(ekb, kte, mv, a, gend,
+                                         initial_state=h0_arg)
+
+    # fp64 reference from the SAME quantized inputs.
+    _, s_ref, hs_ref = chunk_gdn2_fwd_ref(
+        q, k_bf.double(), v_bf.double(), g32.double(),
+        b_bf.double(), w_bf.double(),
+        initial_state=h0.double() if use_h0 else None,
+        chunk_size=chunk, output_h=True,
+    )
+    assert _rel(ht_kernel, s_ref) < RTOL
+    assert _rel(h_kernel, hs_ref.to(h_kernel.dtype).double()) < RTOL
 
 
-@pytest.mark.skip(reason="M3: fused_fwd_2 not yet implemented")
-def test_fused_fwd_2_matches_ref():
-    pass
+@pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
+@pytest.mark.parametrize("use_h0", [False, True])
+def test_chunk_gdn2_fwd_matches_ref(B, T, Hk, Hv, use_h0):
+    try:
+        from flash_qla import chunk_gdn2
+        from flash_qla.ops.gated_delta_rule_2.chunk import CHUNK_SIZE_2, prepare_h_2
+    except Exception as e:
+        pytest.skip(f"flash_qla unavailable here ({type(e).__name__})")
+    if prepare_h_2 is None:
+        pytest.skip("gdn2 forward: not built for this arch yet")
+
+    from ref_gdr2 import chunk_gdn2_fwd_ref
+
+    q, k, v, g, b, w, h0 = _make_inputs_2(B, T, Hk, Hv)
+    q_bf, k_bf = q.to(torch.bfloat16), k.to(torch.bfloat16)
+    v_bf = v.to(torch.bfloat16)
+    b_bf, w_bf = b.to(torch.bfloat16), w.to(torch.bfloat16)
+    g32 = g.float()
+
+    o_k, ht_k = chunk_gdn2(
+        q_bf, k_bf, v_bf, g32, b_bf, w_bf,
+        initial_state=h0.float() if use_h0 else None,
+        output_final_state=True,
+    )
+    o_ref, s_ref = chunk_gdn2_fwd_ref(
+        q_bf.double(), k_bf.double(), v_bf.double(), g32.double(),
+        b_bf.double(), w_bf.double(),
+        initial_state=h0.double() if use_h0 else None,
+        chunk_size=CHUNK_SIZE_2,
+    )
+    assert _rel(o_k, o_ref) < RTOL
+    assert _rel(ht_k, s_ref) < RTOL
 
 
-@pytest.mark.skip(reason="M3: end-to-end fwd parity vs fla chunk_gdn2")
-def test_chunk_gdn2_fwd_vs_fla():
-    pass
+@pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
+def test_chunk_gdn2_fwd_vs_fla(B, T, Hk, Hv):
+    try:
+        from flash_qla import chunk_gdn2
+        from flash_qla.ops.gated_delta_rule_2.chunk import prepare_h_2
+    except Exception as e:
+        pytest.skip(f"flash_qla unavailable here ({type(e).__name__})")
+    if prepare_h_2 is None:
+        pytest.skip("gdn2 forward: not built for this arch yet")
+    try:
+        from fla.ops.gdn2 import chunk_gdn2 as fla_gdn2
+    except Exception as e:
+        pytest.skip(f"fla gdn2 unavailable ({type(e).__name__})")
+
+    q, k, v, g, b, w, h0 = _make_inputs_2(B, T, Hk, Hv)
+    q_bf, k_bf = q.to(torch.bfloat16), k.to(torch.bfloat16)
+    v_bf = v.to(torch.bfloat16)
+    b_bf, w_bf = b.to(torch.bfloat16), w.to(torch.bfloat16)
+    g32 = g.float()
+
+    o_ours, ht_ours = chunk_gdn2(
+        q_bf, k_bf, v_bf, g32, b_bf, w_bf,
+        initial_state=h0.float(), output_final_state=True,
+    )
+    grp = Hv // Hk
+    try:
+        o_fla, ht_fla = fla_gdn2(
+            q=q_bf.repeat_interleave(grp, dim=2),
+            k=k_bf.repeat_interleave(grp, dim=2),
+            v=v_bf, g=g32, b=b_bf, w=w_bf,
+            initial_state=h0.float(), output_final_state=True,
+        )
+    except Exception as e:
+        pytest.skip(f"fla gdn2 call failed here ({type(e).__name__}: {e})")
+    # Two bf16 kernels with different chunk algebra: allow 2x the ref rtol.
+    assert _rel(o_ours, o_fla) < 2 * RTOL
+    assert _rel(ht_ours, ht_fla) < 2 * RTOL
 
 
 @pytest.mark.skip(reason="M4: fused_bwd_2 not yet implemented")

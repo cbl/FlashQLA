@@ -53,16 +53,19 @@ _ARCH = tilelang.contrib.nvcc.get_target_compute_version()
 if _ARCH == "9.0":
     from .hopper import kkt_solve
     prepare_h_2 = None  # hopper port pending (sm120-first development)
+    fused_fwd_2 = None
     CHUNK_SIZE_2 = 64
 elif _ARCH == "12.0":
     from .blackwell_sm120 import kkt_solve
     from .blackwell_sm120.prepare_h import prepare_h_2
+    from .blackwell_sm120.fused_fwd import fused_fwd_2
     CHUNK_SIZE_2 = 32
 else:
     # Unsupported archs see the informative raise in chunk_gdn2 below
     # rather than an import failure.
     kkt_solve = None
     prepare_h_2 = None
+    fused_fwd_2 = None
     CHUNK_SIZE_2 = None
 
 
@@ -122,8 +125,30 @@ def chunk_gdn2(
     )
     assert b.shape == g.shape, "b must be per key channel: [B, T, HV, K]."
     assert w.shape == v.shape, "w must be per value channel: [B, T, HV, V]."
-    raise NotImplementedError(
-        "GDN2 kernels are under construction (M1-M4, see DESIGN_GDR2.md; "
-        "SM90/Hopper first); reference implementations live in "
-        "tests/ref_gdr2.py."
+    if prepare_h_2 is None or fused_fwd_2 is None:
+        raise NotImplementedError(
+            f"GDN2 kernels are not available on this arch (SM{_ARCH}); "
+            "currently SM120 forward-only, SM90 pending (DESIGN_GDR2.md)."
+        )
+    if cu_seqlens is not None:
+        raise NotImplementedError("GDN2: varlen (cu_seqlens) pending.")
+    # FORWARD-ONLY for now (backward is M4): outputs carry no autograd
+    # graph — do not train through this yet.
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if use_qk_l2norm_in_kernel:
+        from flash_qla.utils import l2norm_fwd
+
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
+
+    g_cs, ekb, kte, mv, gend = prepare_inputs_2(k, v, g, b, w, CHUNK_SIZE_2)
+    a = kkt_solve(k, g_cs, b.to(k.dtype), chunk_size=CHUNK_SIZE_2)
+    h, ht, r = prepare_h_2(
+        ekb, kte, mv, a, gend,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        output_h=True,
     )
+    o = fused_fwd_2(q, k, g_cs, r, h, scale)
+    return o, ht
