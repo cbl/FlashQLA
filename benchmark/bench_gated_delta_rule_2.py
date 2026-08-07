@@ -94,12 +94,12 @@ def bench_kkt_stage(args):
     for seq in args.seqlens:
         inputs = make_inputs(args.batch, seq, args.hk, args.hv,
                              args.dim, args.dim)
-        k, g, b = inputs["k"], inputs["g"], inputs["b"]
+        k, g, b, qq = inputs["k"], inputs["g"], inputs["b"], inputs["q"]
         beta_head = b.float().mean(-1)                 # gdn's scalar beta
         g_cs = _chunk_cumsum(g.float(), CHUNK_SIZE_2)
         t_gdn = timeit(lambda: kkt_gdn(k=k, b=beta_head),
                        args.warmup, args.iters)
-        t_gdn2 = timeit(lambda: kkt_gdn2(k, g_cs, b, chunk_size=CHUNK_SIZE_2),
+        t_gdn2 = timeit(lambda: kkt_gdn2(k, g_cs, b, qq, chunk_size=CHUNK_SIZE_2),
                         args.warmup, args.iters)
         print(f"{seq:>8} {t_gdn:14.3f}ms {t_gdn2:9.3f}ms "
               f"{t_gdn2 / t_gdn:5.2f}x")

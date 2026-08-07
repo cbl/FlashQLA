@@ -43,12 +43,14 @@ def tilelang_prepare_inputs_2(
 
     @T.prim_func
     def tilelang_prepare_inputs_2_kernel(
+        q: T.Tensor(k_shape, dtype=qkva_dtype),
         k: T.Tensor(k_shape, dtype=qkva_dtype),
         v: T.Tensor(v_shape, dtype=qkva_dtype),
         g: T.Tensor(x_shape, dtype=g_in_dtype),
         b: T.Tensor(x_shape, dtype=qkva_dtype),
         w: T.Tensor(v_shape, dtype=qkva_dtype),
         g_cs: T.Tensor(x_shape, dtype=accum_dtype),
+        eq: T.Tensor(x_shape, dtype=qkva_dtype),
         ekb: T.Tensor(x_shape, dtype=qkva_dtype),
         kte: T.Tensor(x_shape, dtype=qkva_dtype),
         mv: T.Tensor(v_shape, dtype=qkva_dtype),
@@ -76,6 +78,10 @@ def tilelang_prepare_inputs_2(
             for j_s, j_k in T.Parallel(block_S, DK):
                 if left + j_s < num_tokens:
                     g_cs[bb, left + j_s, bh, j_k] = gcs_shared[j_s, j_k]
+                    eq[bb, left + j_s, bh, j_k] = (
+                        T.exp2(gcs_shared[j_s, j_k] * L2E)
+                        * q[bb, left + j_s, bhg, j_k].astype(accum_dtype)
+                    ).astype(qkva_dtype)
                     ekb[bb, left + j_s, bh, j_k] = (
                         T.exp2(gcs_shared[j_s, j_k] * L2E)
                         * b[bb, left + j_s, bh, j_k].astype(accum_dtype)
@@ -103,6 +109,7 @@ def tilelang_prepare_inputs_2(
 
 
 def prepare_inputs_2_fused(
+    q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -111,7 +118,7 @@ def prepare_inputs_2_fused(
     chunk_size: int,
 ):
     """Drop-in for ``prepare_inputs_2`` (same outputs, one kernel)."""
-    k, v, g, b, w = (x.contiguous() for x in (k, v, g, b, w))
+    q, k, v, g, b, w = (x.contiguous() for x in (q, k, v, g, b, w))
     batch_size, num_tokens, Hg, K = k.shape
     H, V = v.shape[2], v.shape[3]
     num_chunks = tilelang.cdiv(num_tokens, chunk_size)
@@ -119,6 +126,7 @@ def prepare_inputs_2_fused(
     g_cs = torch.empty(
         (batch_size, num_tokens, H, K), dtype=torch.float32, device=k.device
     )
+    eq = torch.empty_like(g_cs, dtype=q.dtype)
     ekb = torch.empty_like(g_cs, dtype=k.dtype)
     kte = torch.empty_like(ekb)
     mv = torch.empty(
@@ -137,5 +145,5 @@ def prepare_inputs_2_fused(
         qkva_dtype=k.dtype,
         g_in_dtype=g.dtype,
     )
-    kernel(k, v, g, b, w, g_cs, ekb, kte, mv, gend)
-    return g_cs, ekb, kte, mv, gend
+    kernel(q, k, v, g, b, w, g_cs, eq, ekb, kte, mv, gend)
+    return g_cs, eq, ekb, kte, mv, gend

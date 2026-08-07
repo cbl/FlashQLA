@@ -64,7 +64,9 @@ def tilelang_kkt_solve_2(
         k,
         g,
         b,
+        q,
         a,
+        attn,
     ):
         left = seq_start_idx + chunk_idx * block_S
         right = left + block_S
@@ -72,12 +74,20 @@ def tilelang_kkt_solve_2(
         k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         b_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         g_shared = T.alloc_shared((block_S, DK), dtype=accum_dtype)
+        q_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         kl_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
+        ql_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
+        attnoff_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
+        attnoff_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
+        attn_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
+        diagq_shared = T.alloc_shared((2, SUB, SUB), dtype=accum_dtype)
         kr_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         arow_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
         arow_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
         a32_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
         diag_local = T.alloc_local((1), dtype=accum_dtype)
+        diagq_local = T.alloc_local((1), dtype=accum_dtype)
+        e_local = T.alloc_local((1), dtype=accum_dtype)
         diag_shared = T.alloc_shared((2, SUB, SUB), dtype=accum_dtype)
 
         a16i_row = T.alloc_fragment((2, 16), dtype=accum_dtype)
@@ -112,9 +122,11 @@ def tilelang_kkt_solve_2(
             if left + j_s < seq_end_idx:
                 b_shared[j_s, j_k] = b[bb, left + j_s, bh, j_k]
                 g_shared[j_s, j_k] = g[bb, left + j_s, bh, j_k]
+                q_shared[j_s, j_k] = q[bb, left + j_s, bhg, j_k]
             else:
                 b_shared[j_s, j_k] = 0
                 g_shared[j_s, j_k] = g[bb, seq_end_idx - 1, bh, j_k]
+                q_shared[j_s, j_k] = 0
         if right <= seq_end_idx:
             T.ptx_wait_group(0)
 
@@ -146,27 +158,67 @@ def tilelang_kkt_solve_2(
         # ownership and lower to atomics; route through shared instead.
         T.copy(arow_fragment, arow_shared)
 
-        # Diagonal sub-blocks: elementwise with per-pair exponents,
-        # accumulated in a per-thread LOCAL and stored straight to shared.
-        # No fragment is involved, so nothing here can lower to atomics.
+        # Off-diagonal ATTENTION block: same kr factor, q on the rows.
+        for j_s, j_k in T.Parallel(SUB, DK):
+            ql_shared[j_s, j_k] = (
+                q_shared[SUB + j_s, j_k].astype(accum_dtype)
+                * T.exp2(
+                    (g_shared[SUB + j_s, j_k] - g_shared[SUB, j_k]) * L2E
+                )
+            ).astype(qkva_dtype)
+        T.gemm(
+            ql_shared, kr_shared, attnoff_fragment,
+            transpose_B=True, clear_accum=True,
+        )
+        T.copy(attnoff_fragment, attnoff_shared)
+
+        # Diagonal sub-blocks: ONE exp2 per (pair, channel) feeds both
+        # the A gram (strict lower) and the attention gram (inclusive).
         for bi in T.serial(2):
             for j_s, j_t in T.Parallel(SUB, SUB):
                 diag_local[0] = 0.0
-                if j_s > j_t:
+                diagq_local[0] = 0.0
+                if j_s >= j_t:
                     for j_k in T.serial(DK):
+                        e_local[0] = T.exp2(
+                            (
+                                g_shared[bi * SUB + j_s, j_k]
+                                - g_shared[bi * SUB + j_t, j_k]
+                            )
+                            * L2E
+                        ) * k_shared[bi * SUB + j_t, j_k].astype(accum_dtype)
+                        diagq_local[0] += (
+                            q_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
+                            * e_local[0]
+                        )
                         diag_local[0] += (
                             b_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
                             * k_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
-                            * k_shared[bi * SUB + j_t, j_k].astype(accum_dtype)
-                            * T.exp2(
-                                (
-                                    g_shared[bi * SUB + j_s, j_k]
-                                    - g_shared[bi * SUB + j_t, j_k]
-                                )
-                                * L2E
-                            )
+                            * e_local[0]
                         )
-                diag_shared[bi, j_s, j_t] = diag_local[0]
+                if j_s > j_t:
+                    diag_shared[bi, j_s, j_t] = diag_local[0]
+                else:
+                    diag_shared[bi, j_s, j_t] = 0.0
+                diagq_shared[bi, j_s, j_t] = diagq_local[0]
+
+        # Assemble and store the attention matrix (inclusive tril).
+        for j_s, j_t in T.Parallel(block_S, block_S):
+            if (j_s // SUB) == (j_t // SUB):
+                attn_fragment[j_s, j_t] = diagq_shared[
+                    j_s // SUB, j_s % SUB, j_t % SUB
+                ]
+            elif (j_s // SUB) > (j_t // SUB):
+                attn_fragment[j_s, j_t] = attnoff_shared[j_s - SUB, j_t]
+            else:
+                attn_fragment[j_s, j_t] = 0
+        T.copy(attn_fragment, a32_shared)
+        if right <= seq_end_idx:
+            T.copy(a32_shared, attn[bb, left:right, bh, 0:block_S])
+        else:
+            for j_s, j_t in T.Parallel(block_S, block_S):
+                if left + j_s < seq_end_idx:
+                    attn[bb, left + j_s, bh, j_t] = a32_shared[j_s, j_t]
 
         # Assemble A = I + StrictLower(A): every thread writes only its
         # own a32_fragment elements, reading from shared.
@@ -249,9 +301,11 @@ def tilelang_kkt_solve_2(
             k: T.Tensor(k_shape, dtype=qkva_dtype),
             g: T.Tensor(g_shape, dtype=g_dtype),
             b: T.Tensor(b_shape, dtype=qkva_dtype),
+            q: T.Tensor(k_shape, dtype=qkva_dtype),
             cu_seqlens: T.Tensor([real_batch_size + 1], dtype=seqlen_dtype),
             chunk_indices: T.Tensor([num_chunks, 2], dtype=seqlen_dtype),
             a: T.Tensor(a_shape, dtype=qkva_dtype),
+            attn: T.Tensor(a_shape, dtype=qkva_dtype),
         ):
             with T.Kernel(num_chunks * H, threads=128) as (bch,):
                 bc, bh = bch // H, bch % H
@@ -280,7 +334,9 @@ def tilelang_kkt_solve_2(
                     k,
                     g,
                     b,
+                    q,
                     a,
+                    attn,
                 )
 
     else:
@@ -290,7 +346,9 @@ def tilelang_kkt_solve_2(
             k: T.Tensor(k_shape, dtype=qkva_dtype),
             g: T.Tensor(g_shape, dtype=g_dtype),
             b: T.Tensor(b_shape, dtype=qkva_dtype),
+            q: T.Tensor(k_shape, dtype=qkva_dtype),
             a: T.Tensor(a_shape, dtype=qkva_dtype),
+            attn: T.Tensor(a_shape, dtype=qkva_dtype),
             num_chunks: T.int32,
         ):
             with T.Kernel(num_chunks * H, threads=128) as (bch,):
@@ -320,7 +378,9 @@ def tilelang_kkt_solve_2(
                     k,
                     g,
                     b,
+                    q,
                     a,
+                    attn,
                 )
 
     return tilelang_kkt_solve_2_kernel
@@ -330,6 +390,7 @@ def kkt_solve(
     k: torch.Tensor,
     g: torch.Tensor,
     b: torch.Tensor,
+    q: torch.Tensor,
     chunk_size: int = 32,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ):
@@ -339,7 +400,7 @@ def kkt_solve(
     INCLUSIVE cumsum of the log decay; b: [B, T, H, K] (same dtype as k).
     Returns a: [B, T, H, chunk_size] in k.dtype.
     """
-    k, g, b = k.contiguous(), g.contiguous(), b.contiguous()
+    k, g, b, q = k.contiguous(), g.contiguous(), b.contiguous(), q.contiguous()
     batch_size, num_tokens, Hg, K = k.shape
     H = b.shape[2]
     assert K == 128
@@ -359,6 +420,7 @@ def kkt_solve(
     a = torch.empty(
         (batch_size, num_tokens, H, chunk_size), dtype=k.dtype, device=k.device
     )
+    attn = torch.empty_like(a)
 
     kernel = tilelang_kkt_solve_2(
         H,
@@ -372,8 +434,8 @@ def kkt_solve(
         is_varlen=is_varlen,
     )
     if is_varlen:
-        kernel(k, g, b, cu_seqlens, chunk_indices, a)
+        kernel(k, g, b, q, cu_seqlens, chunk_indices, a, attn)
     else:
-        kernel(k, g, b, a, num_chunks)
+        kernel(k, g, b, q, a, attn, num_chunks)
 
-    return a
+    return a, attn

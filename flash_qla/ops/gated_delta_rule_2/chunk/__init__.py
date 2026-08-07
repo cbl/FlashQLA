@@ -56,12 +56,12 @@ from .prepare_inputs import prepare_inputs_2
 _prepare_inputs_fused = None
 
 
-def _prepare_inputs(k, v, g, b, w, chunk_size):
+def _prepare_inputs(q, k, v, g, b, w, chunk_size):
     """Preference: single tilelang kernel > torch.compile > eager torch.
     The winner is pinned after its first successful call."""
     global _prepare_inputs_fused
     if _prepare_inputs_fused is not None:
-        return _prepare_inputs_fused(k, v, g, b, w, chunk_size)
+        return _prepare_inputs_fused(q, k, v, g, b, w, chunk_size)
     candidates = []
     try:
         from .prepare_inputs_tl import prepare_inputs_2_fused
@@ -75,12 +75,12 @@ def _prepare_inputs(k, v, g, b, w, chunk_size):
     candidates.append(prepare_inputs_2)
     for cand in candidates:
         try:
-            out = cand(k, v, g, b, w, chunk_size)
+            out = cand(q, k, v, g, b, w, chunk_size)
             _prepare_inputs_fused = cand
             return out
         except Exception:
             continue
-    return prepare_inputs_2(k, v, g, b, w, chunk_size)
+    return prepare_inputs_2(q, k, v, g, b, w, chunk_size)
 
 _ARCH = tilelang.contrib.nvcc.get_target_compute_version()
 if _ARCH == "9.0":
@@ -175,13 +175,13 @@ def chunk_gdn2(
         q, _ = l2norm_fwd(q)
         k, _ = l2norm_fwd(k)
 
-    g_cs, ekb, kte, mv, gend = _prepare_inputs(k, v, g, b, w, CHUNK_SIZE_2)
-    a = kkt_solve(k, g_cs, b.to(k.dtype), chunk_size=CHUNK_SIZE_2)
+    g_cs, eq, ekb, kte, mv, gend = _prepare_inputs(q, k, v, g, b, w, CHUNK_SIZE_2)
+    a, attn = kkt_solve(k, g_cs, b.to(k.dtype), q, chunk_size=CHUNK_SIZE_2)
     h, ht, r = prepare_h_2(
         ekb, kte, mv, a, gend,
         initial_state=initial_state,
         output_final_state=output_final_state,
         output_h=True,
     )
-    o = fused_fwd_2(q, k, g_cs, r, h, scale)
+    o = fused_fwd_2(eq, attn, r, h, scale)
     return o, ht

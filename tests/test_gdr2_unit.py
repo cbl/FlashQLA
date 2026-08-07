@@ -107,11 +107,11 @@ def test_prepare_inputs_fused_matches_torch(B, T, Hk, Hv):
         pytest.skip("unsupported arch")
 
     q, k, v, g, b, w, h0 = _make_inputs_2(B, T, Hk, Hv)
-    args = (k.to(torch.bfloat16), v.to(torch.bfloat16), g.float(),
-            b.to(torch.bfloat16), w.to(torch.bfloat16), CHUNK_SIZE_2)
+    args = (q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16),
+            g.float(), b.to(torch.bfloat16), w.to(torch.bfloat16), CHUNK_SIZE_2)
     ref = prepare_inputs_2(*args)
     fused = prepare_inputs_2_fused(*args)
-    for name, a, c in zip(("g_cs", "ekb", "kte", "mv", "gend"), fused, ref):
+    for name, a, c in zip(("g_cs", "eq", "ekb", "kte", "mv", "gend"), fused, ref):
         assert _rel(a, c.double()) < RTOL, f"{name} mismatch"
 
 
@@ -173,7 +173,8 @@ def test_kkt_solve_2_matches_ref(B, T, Hk, Hv):
     b_bf = b.to(torch.bfloat16)
     g_cs = _chunk_cumsum(g.float(), chunk)                     # fp32, kernel input
 
-    a_kernel = kkt_solve(k_bf, g_cs, b_bf, chunk_size=chunk)   # [B, T, Hv, C]
+    a_kernel, attn_kernel = kkt_solve(k_bf, g_cs, b_bf, q.to(torch.bfloat16),
+                                      chunk_size=chunk)
 
     # fp64 reference from the SAME quantized inputs.
     kc = _pad_chunks(_expand_heads(k_bf.double(), Hv), chunk)
@@ -183,6 +184,14 @@ def test_kkt_solve_2_matches_ref(B, T, Hk, Hv):
     t_ref = t_ref.permute(0, 1, 3, 2, 4).reshape(B, -1, Hv, chunk)[:, :T]
 
     assert _rel(a_kernel[:, :T], t_ref) < RTOL
+
+    # the merged attention output: inclusive-tril decayed q-gram
+    from ref_gdr2 import _causal_decay
+    qc = _pad_chunks(_expand_heads(q.to(torch.bfloat16).double(), Hv), chunk)
+    diff = _causal_decay(gc)
+    attn_ref = torch.einsum("bnihk,bnijhk,bnjhk->bnhij", qc, diff, kc)
+    attn_ref = attn_ref.permute(0, 1, 3, 2, 4).reshape(B, -1, Hv, chunk)[:, :T]
+    assert _rel(attn_kernel[:, :T], attn_ref) < RTOL
 
 
 @pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
@@ -206,8 +215,9 @@ def test_prepare_h_2_matches_ref(B, T, Hk, Hv, use_h0):
     g32 = g.float()
     h0_arg = h0.float() if use_h0 else None
 
-    g_cs, ekb, kte, mv, gend = prepare_inputs_2(k_bf, v_bf, g32, b_bf, w_bf, chunk)
-    a = kkt_solve(k_bf, g_cs, b_bf, chunk_size=chunk)
+    g_cs, _, ekb, kte, mv, gend = prepare_inputs_2(
+        q.to(torch.bfloat16), k_bf, v_bf, g32, b_bf, w_bf, chunk)
+    a, _ = kkt_solve(k_bf, g_cs, b_bf, q.to(torch.bfloat16), chunk_size=chunk)
     h_kernel, ht_kernel, r_kernel = prepare_h_2(ekb, kte, mv, a, gend,
                                                 initial_state=h0_arg)
 

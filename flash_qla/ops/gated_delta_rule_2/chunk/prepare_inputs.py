@@ -13,6 +13,7 @@ optimization (fla's Triton gdn2 materializes comparable intermediates).
 Given per-chunk inclusive cumsum G of the log decay g:
 
     g_cs      = G                                  [B, T, H, K]  fp32
+    eq        = exp(G) * q                         [B, T, H, K]  q.dtype
     ekb       = exp(G) * b * k                     [B, T, H, K]  k.dtype
     k_to_end  = exp(G_end - G) * k                 [B, T, H, K]  k.dtype
     mv        = w * v                              [B, T, H, V]  v.dtype
@@ -26,6 +27,7 @@ import torch
 
 
 def prepare_inputs_2(
+    q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -36,6 +38,7 @@ def prepare_inputs_2(
     bsz, t, hg, d_k = k.shape
     h = g.shape[2]
     if hg != h:
+        q = q.repeat_interleave(h // hg, dim=2)
         k = k.repeat_interleave(h // hg, dim=2)
 
     pad = (-t) % chunk_size
@@ -52,7 +55,8 @@ def prepare_inputs_2(
         g_end[:, :, None] - gc
     ).reshape(bsz, -1, h, d_k)[:, :t]
 
+    eq = (g_cs.exp() * q.float()).to(q.dtype)
     ekb = (g_cs.exp() * b.float() * k.float()).to(k.dtype)
     k_to_end = (to_end.exp() * k.float()).to(k.dtype)
     mv = (w.float() * v.float()).to(v.dtype)
-    return g_cs, ekb, k_to_end, mv, g_end.exp().contiguous()
+    return g_cs, eq, ekb, k_to_end, mv, g_end.exp().contiguous()
