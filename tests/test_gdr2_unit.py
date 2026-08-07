@@ -90,6 +90,31 @@ def test_bwd_ref_shapes():
     assert dh0.shape == h0.shape
 
 
+@pytest.mark.skipif(DEVICE != "cuda", reason="tilelang kernels are CUDA-only")
+@pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
+def test_prepare_inputs_fused_matches_torch(B, T, Hk, Hv):
+    try:
+        from flash_qla.ops.gated_delta_rule_2.chunk import CHUNK_SIZE_2
+        from flash_qla.ops.gated_delta_rule_2.chunk.prepare_inputs import (
+            prepare_inputs_2,
+        )
+        from flash_qla.ops.gated_delta_rule_2.chunk.prepare_inputs_tl import (
+            prepare_inputs_2_fused,
+        )
+    except Exception as e:
+        pytest.skip(f"flash_qla unavailable here ({type(e).__name__})")
+    if CHUNK_SIZE_2 is None:
+        pytest.skip("unsupported arch")
+
+    q, k, v, g, b, w, h0 = _make_inputs_2(B, T, Hk, Hv)
+    args = (k.to(torch.bfloat16), v.to(torch.bfloat16), g.float(),
+            b.to(torch.bfloat16), w.to(torch.bfloat16), CHUNK_SIZE_2)
+    ref = prepare_inputs_2(*args)
+    fused = prepare_inputs_2_fused(*args)
+    for name, a, c in zip(("g_cs", "ekb", "kte", "mv", "gend"), fused, ref):
+        assert _rel(a, c.double()) < RTOL, f"{name} mismatch"
+
+
 # ---------------------------------------------------------------------------
 # Rung 3: degeneracy — per-head gates reduce GDN2 to GDN, checked against
 # the shipped gdn kernels (runs before any gdn2 kernel exists)

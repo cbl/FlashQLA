@@ -57,20 +57,30 @@ _prepare_inputs_fused = None
 
 
 def _prepare_inputs(k, v, g, b, w, chunk_size):
+    """Preference: single tilelang kernel > torch.compile > eager torch.
+    The winner is pinned after its first successful call."""
     global _prepare_inputs_fused
-    if _prepare_inputs_fused is None:
-        try:
-            _prepare_inputs_fused = torch.compile(
-                prepare_inputs_2, dynamic=True
-            )
-        except Exception:
-            _prepare_inputs_fused = prepare_inputs_2
-    try:
+    if _prepare_inputs_fused is not None:
         return _prepare_inputs_fused(k, v, g, b, w, chunk_size)
+    candidates = []
+    try:
+        from .prepare_inputs_tl import prepare_inputs_2_fused
+        candidates.append(prepare_inputs_2_fused)
     except Exception:
-        # torch.compile backend failure at runtime: pin eager from now on.
-        _prepare_inputs_fused = prepare_inputs_2
-        return prepare_inputs_2(k, v, g, b, w, chunk_size)
+        pass
+    try:
+        candidates.append(torch.compile(prepare_inputs_2, dynamic=True))
+    except Exception:
+        pass
+    candidates.append(prepare_inputs_2)
+    for cand in candidates:
+        try:
+            out = cand(k, v, g, b, w, chunk_size)
+            _prepare_inputs_fused = cand
+            return out
+        except Exception:
+            continue
+    return prepare_inputs_2(k, v, g, b, w, chunk_size)
 
 _ARCH = tilelang.contrib.nvcc.get_target_compute_version()
 if _ARCH == "9.0":
