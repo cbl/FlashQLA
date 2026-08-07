@@ -123,9 +123,41 @@ def test_degeneracy_vs_gdn_kernel(B, T, Hk, Hv):
 # Rung 4: per-kernel stage tests — unlocked milestone by milestone
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="M1: kkt_solve_2 not yet implemented")
-def test_kkt_solve_2_matches_ref():
-    pass
+def _chunk_cumsum(g: torch.Tensor, chunk_size: int = 64) -> torch.Tensor:
+    """Chunk-local inclusive cumsum over T, shape-preserving."""
+    from ref_gdr2 import _pad_chunks
+    bsz, t = g.shape[:2]
+    gc = _pad_chunks(g, chunk_size).cumsum(dim=2)
+    return gc.reshape(bsz, -1, *g.shape[2:])[:, :t]
+
+
+@pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
+def test_kkt_solve_2_matches_ref(B, T, Hk, Hv):
+    try:
+        from flash_qla.ops.gated_delta_rule_2.chunk import kkt_solve
+    except Exception as e:  # no CUDA / no tilelang on this machine
+        pytest.skip(f"flash_qla unavailable here ({type(e).__name__})")
+    if kkt_solve is None:
+        pytest.skip("gdn2 kkt_solve targets SM90 only")
+
+    from ref_gdr2 import _expand_heads, _pad_chunks, ref_kkt_2, ref_solve
+
+    q, k, v, g, b, w, h0 = _make_inputs_2(B, T, Hk, Hv)
+    chunk = 64
+    k_bf = k.to(torch.bfloat16)
+    b_bf = b.to(torch.bfloat16)
+    g_cs = _chunk_cumsum(g.float(), chunk)                     # fp32, kernel input
+
+    a_kernel = kkt_solve(k_bf, g_cs, b_bf, chunk_size=chunk)   # [B, T, Hv, C]
+
+    # fp64 reference from the SAME quantized inputs.
+    kc = _pad_chunks(_expand_heads(k_bf.double(), Hv), chunk)
+    bc = _pad_chunks(b_bf.double(), chunk)
+    gc = _pad_chunks(g.float().double(), chunk).cumsum(dim=2)
+    t_ref = ref_solve(ref_kkt_2(kc, gc, bc))                   # [B, N, Hv, C, C]
+    t_ref = t_ref.permute(0, 1, 3, 2, 4).reshape(B, -1, Hv, chunk)[:, :T]
+
+    assert _rel(a_kernel[:, :T], t_ref) < RTOL
 
 
 @pytest.mark.skip(reason="M2: prepare_h_2 not yet implemented")

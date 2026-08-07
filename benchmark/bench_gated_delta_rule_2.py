@@ -69,6 +69,40 @@ def bench_impl(kernel, inputs, expand_qk, warmup, iters, bwd):
     return fwd_ms, timeit(step, warmup, iters)
 
 
+def _chunk_cumsum(g, chunk_size=64):
+    bsz, t = g.shape[:2]
+    pad = (-t) % chunk_size
+    if pad:
+        g = torch.cat([g, g.new_zeros(bsz, pad, *g.shape[2:])], dim=1)
+    g = g.view(bsz, -1, chunk_size, *g.shape[2:]).cumsum(dim=2)
+    return g.reshape(bsz, -1, *g.shape[3:])[:, :t]
+
+
+def bench_kkt_stage(args):
+    """Time gdn2 kkt_solve_2 against the gdn kkt_solve at the same
+    shapes — a lower bound, since gdn2's A-build does strictly more
+    work. An early perf signal available before the full forward (M3)."""
+    from flash_qla.ops.gated_delta_rule.chunk import kkt_solve as kkt_gdn
+    from flash_qla.ops.gated_delta_rule_2.chunk import kkt_solve as kkt_gdn2
+    assert kkt_gdn2 is not None, "gdn2 kkt_solve targets SM90 only"
+
+    print(f"kkt stage bench  B={args.batch} hk={args.hk} hv={args.hv} "
+          f"d={args.dim} bf16")
+    print(f"{'seq':>8} {'gdn kkt':>10} {'gdn2 kkt':>10} {'ratio':>6}")
+    for seq in args.seqlens:
+        inputs = make_inputs(args.batch, seq, args.hk, args.hv,
+                             args.dim, args.dim)
+        k, g, b = inputs["k"], inputs["g"], inputs["b"]
+        beta_head = b.float().mean(-1)                 # gdn's scalar beta
+        g_cs = _chunk_cumsum(g.float())
+        t_gdn = timeit(lambda: kkt_gdn(k=k, b=beta_head),
+                       args.warmup, args.iters)
+        t_gdn2 = timeit(lambda: kkt_gdn2(k, g_cs, b),
+                        args.warmup, args.iters)
+        print(f"{seq:>8} {t_gdn:9.3f}ms {t_gdn2:9.3f}ms "
+              f"{t_gdn2 / t_gdn:5.2f}x")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--batch", type=int, default=1)
@@ -80,7 +114,13 @@ def main():
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--bwd", action="store_true")
+    p.add_argument("--stage", choices=["full", "kkt"], default="full",
+                   help="'kkt' times the gdn2 A-build kernel alone vs gdn's")
     args = p.parse_args()
+
+    if args.stage == "kkt":
+        bench_kkt_stage(args)
+        return
 
     from fla.ops.gdn2 import chunk_gdn2 as fla_gdn2
     try:

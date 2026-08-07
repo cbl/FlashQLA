@@ -14,6 +14,13 @@ Kernel status (milestones in DESIGN_GDR2.md):
 import torch
 import tilelang
 
+if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
+    from .hopper import kkt_solve
+else:
+    # GDN2 kernels target SM90 first; other archs see the informative
+    # raise in chunk_gdn2 below rather than an import failure.
+    kkt_solve = None
+
 
 def chunk_gdn2(
     q: torch.Tensor,
