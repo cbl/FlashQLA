@@ -47,17 +47,22 @@ def _ensure_cuda_cccl() -> None:
 
 _ensure_cuda_cccl()
 
+from .prepare_inputs import prepare_inputs_2
+
 _ARCH = tilelang.contrib.nvcc.get_target_compute_version()
 if _ARCH == "9.0":
     from .hopper import kkt_solve
+    prepare_h_2 = None  # hopper port pending (sm120-first development)
     CHUNK_SIZE_2 = 64
 elif _ARCH == "12.0":
     from .blackwell_sm120 import kkt_solve
+    from .blackwell_sm120.prepare_h import prepare_h_2
     CHUNK_SIZE_2 = 32
 else:
     # Unsupported archs see the informative raise in chunk_gdn2 below
     # rather than an import failure.
     kkt_solve = None
+    prepare_h_2 = None
     CHUNK_SIZE_2 = None
 
 
