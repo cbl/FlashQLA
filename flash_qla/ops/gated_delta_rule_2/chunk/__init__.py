@@ -49,6 +49,29 @@ _ensure_cuda_cccl()
 
 from .prepare_inputs import prepare_inputs_2
 
+# The decay-folding precompute is ~15 small elementwise/cumsum torch ops;
+# uncompiled it dominates the forward (~2/3 of GPU time measured on
+# SM120). torch.compile fuses it; fall back to eager if compilation is
+# unavailable. Compiled lazily on first use.
+_prepare_inputs_fused = None
+
+
+def _prepare_inputs(k, v, g, b, w, chunk_size):
+    global _prepare_inputs_fused
+    if _prepare_inputs_fused is None:
+        try:
+            _prepare_inputs_fused = torch.compile(
+                prepare_inputs_2, dynamic=True
+            )
+        except Exception:
+            _prepare_inputs_fused = prepare_inputs_2
+    try:
+        return _prepare_inputs_fused(k, v, g, b, w, chunk_size)
+    except Exception:
+        # torch.compile backend failure at runtime: pin eager from now on.
+        _prepare_inputs_fused = prepare_inputs_2
+        return prepare_inputs_2(k, v, g, b, w, chunk_size)
+
 _ARCH = tilelang.contrib.nvcc.get_target_compute_version()
 if _ARCH == "9.0":
     from .hopper import kkt_solve
@@ -142,7 +165,7 @@ def chunk_gdn2(
         q, _ = l2norm_fwd(q)
         k, _ = l2norm_fwd(k)
 
-    g_cs, ekb, kte, mv, gend = prepare_inputs_2(k, v, g, b, w, CHUNK_SIZE_2)
+    g_cs, ekb, kte, mv, gend = _prepare_inputs(k, v, g, b, w, CHUNK_SIZE_2)
     a = kkt_solve(k, g_cs, b.to(k.dtype), chunk_size=CHUNK_SIZE_2)
     h, ht, r = prepare_h_2(
         ekb, kte, mv, a, gend,
