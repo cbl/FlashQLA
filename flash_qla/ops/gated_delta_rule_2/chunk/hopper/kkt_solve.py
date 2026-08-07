@@ -84,7 +84,7 @@ def tilelang_kkt_solve_2(
         arow_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
         off_shared = T.alloc_shared((block_S, block_S), dtype=accum_dtype)
         a64_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
-        diag_acc = T.alloc_fragment((SUB, SUB), dtype=accum_dtype)
+        diag_local = T.alloc_local((1), dtype=accum_dtype)
         diag_shared = T.alloc_shared((NSUB, SUB, SUB), dtype=accum_dtype)
 
         a16i_row = T.alloc_fragment((4, 16), dtype=accum_dtype)
@@ -172,14 +172,16 @@ def tilelang_kkt_solve_2(
                 for j_s, j_t in T.Parallel(SUB, block_S):
                     off_shared[bi * SUB + j_s, j_t] = arow_fragment[j_s, j_t]
 
-        # Diagonal sub-blocks: elementwise with per-pair exponents — the
-        # only form bounded for arbitrary gate magnitudes inside a block.
+        # Diagonal sub-blocks: elementwise with per-pair exponents (the
+        # only form bounded for arbitrary gate magnitudes inside a block),
+        # accumulated in a per-thread LOCAL and stored straight to shared.
+        # No fragment is involved, so nothing here can lower to atomics.
         for bi in T.serial(NSUB):
-            T.clear(diag_acc)
             for j_s, j_t in T.Parallel(SUB, SUB):
+                diag_local[0] = 0.0
                 if j_s > j_t:
                     for j_k in T.serial(DK):
-                        diag_acc[j_s, j_t] += (
+                        diag_local[0] += (
                             b_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
                             * k_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
                             * k_shared[bi * SUB + j_t, j_k].astype(accum_dtype)
@@ -191,8 +193,7 @@ def tilelang_kkt_solve_2(
                                 * L2E
                             )
                         )
-            for j_s, j_t in T.Parallel(SUB, SUB):
-                diag_shared[bi, j_s, j_t] = diag_acc[j_s, j_t]
+                diag_shared[bi, j_s, j_t] = diag_local[0]
 
         # Assemble A = I + StrictLower(A): every thread writes only its
         # own a64_fragment elements, reading from shared.

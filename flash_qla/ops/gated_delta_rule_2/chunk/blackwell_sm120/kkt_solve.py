@@ -77,7 +77,7 @@ def tilelang_kkt_solve_2(
         arow_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
         arow_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
         a32_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
-        diag_acc = T.alloc_fragment((SUB, SUB), dtype=accum_dtype)
+        diag_local = T.alloc_local((1), dtype=accum_dtype)
         diag_shared = T.alloc_shared((2, SUB, SUB), dtype=accum_dtype)
 
         a16i_row = T.alloc_fragment((2, 16), dtype=accum_dtype)
@@ -146,13 +146,15 @@ def tilelang_kkt_solve_2(
         # ownership and lower to atomics; route through shared instead.
         T.copy(arow_fragment, arow_shared)
 
-        # Diagonal sub-blocks: elementwise with per-pair exponents.
+        # Diagonal sub-blocks: elementwise with per-pair exponents,
+        # accumulated in a per-thread LOCAL and stored straight to shared.
+        # No fragment is involved, so nothing here can lower to atomics.
         for bi in T.serial(2):
-            T.clear(diag_acc)
             for j_s, j_t in T.Parallel(SUB, SUB):
+                diag_local[0] = 0.0
                 if j_s > j_t:
                     for j_k in T.serial(DK):
-                        diag_acc[j_s, j_t] += (
+                        diag_local[0] += (
                             b_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
                             * k_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
                             * k_shared[bi * SUB + j_t, j_k].astype(accum_dtype)
@@ -164,8 +166,7 @@ def tilelang_kkt_solve_2(
                                 * L2E
                             )
                         )
-            for j_s, j_t in T.Parallel(SUB, SUB):
-                diag_shared[bi, j_s, j_t] = diag_acc[j_s, j_t]
+                diag_shared[bi, j_s, j_t] = diag_local[0]
 
         # Assemble A = I + StrictLower(A): every thread writes only its
         # own a32_fragment elements, reading from shared.
