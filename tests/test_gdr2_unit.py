@@ -183,8 +183,8 @@ def test_prepare_h_2_matches_ref(B, T, Hk, Hv, use_h0):
 
     g_cs, ekb, kte, mv, gend = prepare_inputs_2(k_bf, v_bf, g32, b_bf, w_bf, chunk)
     a = kkt_solve(k_bf, g_cs, b_bf, chunk_size=chunk)
-    h_kernel, ht_kernel, _ = prepare_h_2(ekb, kte, mv, a, gend,
-                                         initial_state=h0_arg)
+    h_kernel, ht_kernel, r_kernel = prepare_h_2(ekb, kte, mv, a, gend,
+                                                initial_state=h0_arg)
 
     # fp64 reference from the SAME quantized inputs.
     _, s_ref, hs_ref = chunk_gdn2_fwd_ref(
@@ -195,6 +195,18 @@ def test_prepare_h_2_matches_ref(B, T, Hk, Hv, use_h0):
     )
     assert _rel(ht_kernel, s_ref) < RTOL
     assert _rel(h_kernel, hs_ref.to(h_kernel.dtype).double()) < RTOL
+
+    # r feeds fused_fwd and has no other test: emulate R = A @ (mv - ekb@S)
+    # in fp32 from the kernel's own (already validated) inputs and states.
+    from ref_gdr2 import _pad_chunks
+    a_c = _pad_chunks(a.float(), chunk)          # [B, N, C, H, C]
+    ekb_c = _pad_chunks(ekb.float(), chunk)
+    mv_c = _pad_chunks(mv.float(), chunk)
+    r_c = _pad_chunks(r_kernel.float(), chunk)
+    for i in range(min(2, h_kernel.shape[1])):
+        u = torch.einsum("bchk,bhkv->bchv", ekb_c[:, i], h_kernel[:, i].float())
+        r_ref = torch.einsum("bihj,bjhv->bihv", a_c[:, i], mv_c[:, i] - u)
+        assert _rel(r_c[:, i], r_ref.double()) < RTOL, f"r mismatch chunk {i}"
 
 
 @pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
