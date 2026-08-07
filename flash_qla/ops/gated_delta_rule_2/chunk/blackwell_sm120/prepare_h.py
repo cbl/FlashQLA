@@ -40,12 +40,14 @@ def tilelang_prepare_h_2(
     use_initial_state,
     store_final_state,
     store_h,
+    v_split,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
     num_chunks = T.dynamic("num_chunks")
     num_h_chunks = T.dynamic("num_h_chunks")
     block_S = chunk_size
+    DVS = DV // v_split
 
     x_shape = (batch_size, num_tokens, H, DK)
     v_shape = (batch_size, num_tokens, H, DV)
@@ -67,24 +69,26 @@ def tilelang_prepare_h_2(
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
         r: T.Tensor(v_shape, dtype=qkva_dtype),
     ):
-        with T.Kernel(batch_size * H, threads=256) as (bbh,):
-            bb, bh = bbh // H, bbh % H
+        with T.Kernel(batch_size * H * v_split, threads=256) as (bbhv,):
+            bb = bbhv // (H * v_split)
+            bh = (bbhv % (H * v_split)) // v_split
+            vo = (bbhv % v_split) * DVS
 
             ekb_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             kte_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
-            mv_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
+            mv_shared = T.alloc_shared((block_S, DVS), dtype=qkva_dtype)
             a_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
             gend_shared = T.alloc_shared((DK), dtype=accum_dtype, scope="shared")
-            h_shared = T.alloc_shared((DK, DV), dtype=qkva_dtype)
-            ymu_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
-            r_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
+            h_shared = T.alloc_shared((DK, DVS), dtype=qkva_dtype)
+            ymu_shared = T.alloc_shared((block_S, DVS), dtype=qkva_dtype)
+            r_shared = T.alloc_shared((block_S, DVS), dtype=qkva_dtype)
 
-            h_fragment = T.alloc_fragment((DK, DV), dtype=accum_dtype)
-            u_fragment = T.alloc_fragment((block_S, DV), dtype=accum_dtype)
-            r_fragment = T.alloc_fragment((block_S, DV), dtype=accum_dtype)
+            h_fragment = T.alloc_fragment((DK, DVS), dtype=accum_dtype)
+            u_fragment = T.alloc_fragment((block_S, DVS), dtype=accum_dtype)
+            r_fragment = T.alloc_fragment((block_S, DVS), dtype=accum_dtype)
 
             if use_initial_state:
-                T.copy(h0[bb, bh, 0:DK, 0:DV], h_fragment)
+                T.copy(h0[bb, bh, 0:DK, vo:vo + DVS], h_fragment)
             else:
                 T.clear(h_fragment)
 
@@ -100,9 +104,9 @@ def tilelang_prepare_h_2(
                     else:
                         ekb_shared[j_s, j_k] = 0
                         kte_shared[j_s, j_k] = 0
-                for j_s, j_v in T.Parallel(block_S, DV):
+                for j_s, j_v in T.Parallel(block_S, DVS):
                     if left + j_s < num_tokens:
-                        mv_shared[j_s, j_v] = mv[bb, left + j_s, bh, j_v]
+                        mv_shared[j_s, j_v] = mv[bb, left + j_s, bh, vo + j_v]
                     else:
                         mv_shared[j_s, j_v] = 0
                 for j_s, j_t in T.Parallel(block_S, block_S):
@@ -116,12 +120,12 @@ def tilelang_prepare_h_2(
                 # The chunk's ENTERING state, for the fused_fwd stage.
                 T.copy(h_fragment, h_shared)
                 if store_h:
-                    T.copy(h_shared, h[bb, i_s, bh, 0:DK, 0:DV])
+                    T.copy(h_shared, h[bb, i_s, bh, 0:DK, vo:vo + DVS])
 
                 # U = ekb @ S
                 T.gemm(ekb_shared, h_shared, u_fragment, clear_accum=True)
                 # ymu = mv - U
-                for j_s, j_v in T.Parallel(block_S, DV):
+                for j_s, j_v in T.Parallel(block_S, DVS):
                     u_fragment[j_s, j_v] = (
                         mv_shared[j_s, j_v].astype(accum_dtype)
                         - u_fragment[j_s, j_v]
@@ -131,12 +135,12 @@ def tilelang_prepare_h_2(
                 # R = A @ (mv - U); stored for the fused_fwd stage.
                 T.gemm(a_shared, ymu_shared, r_fragment, clear_accum=True)
                 T.copy(r_fragment, r_shared)
-                for j_s, j_v in T.Parallel(block_S, DV):
+                for j_s, j_v in T.Parallel(block_S, DVS):
                     if left + j_s < num_tokens:
-                        r[bb, left + j_s, bh, j_v] = r_shared[j_s, j_v]
+                        r[bb, left + j_s, bh, vo + j_v] = r_shared[j_s, j_v]
 
                 # S = g_end * S  (per KEY row), then S += k_to_end^T @ R
-                for j_k, j_v in T.Parallel(DK, DV):
+                for j_k, j_v in T.Parallel(DK, DVS):
                     h_fragment[j_k, j_v] *= gend_shared[j_k]
                 T.gemm(
                     kte_shared, r_shared, h_fragment,
@@ -144,7 +148,7 @@ def tilelang_prepare_h_2(
                 )
 
             if store_final_state:
-                T.copy(h_fragment, ht[bb, bh, 0:DK, 0:DV])
+                T.copy(h_fragment, ht[bb, bh, 0:DK, vo:vo + DVS])
 
     return tilelang_prepare_h_2_kernel
 
@@ -207,6 +211,7 @@ def prepare_h_2(
         use_initial_state=use_initial_state,
         store_final_state=output_final_state,
         store_h=output_h,
+        v_split=4,
     )
     kernel(ekb, kte, mv, a, g_end_exp, initial_state, h, ht, r)
 
