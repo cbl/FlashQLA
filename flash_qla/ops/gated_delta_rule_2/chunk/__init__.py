@@ -11,8 +11,41 @@ Kernel status (milestones in DESIGN_GDR2.md):
     M1 kkt_solve_2 / M2 prepare_h_2 / M3 fused_fwd_2 / M4 fused_bwd_2
 """
 
+import glob
+import os
+import site
+
 import torch
 import tilelang
+
+
+def _ensure_cuda_cccl() -> None:
+    """tilelang-generated code can include <cuda/atomic> (libcu++/CCCL).
+    Minimal CUDA installs keep those headers off nvcc's default include
+    path; locate them and prepend CPATH so the in-process nvcc invocation
+    finds them. No-op when already resolvable or genuinely absent."""
+    patterns = [
+        "/usr/local/cuda/include/cuda/atomic",
+        "/usr/local/cuda-*/include/cuda/atomic",
+    ]
+    try:
+        for sp in site.getsitepackages():
+            patterns += [
+                os.path.join(sp, "nvidia", "*", "include", "cuda", "atomic"),
+                os.path.join(sp, "nvidia", "*", "*", "include", "cuda", "atomic"),
+            ]
+    except Exception:
+        pass
+    for pattern in patterns:
+        for hit in glob.glob(pattern):
+            inc = os.path.dirname(os.path.dirname(hit))
+            cpath = os.environ.get("CPATH", "")
+            if inc not in cpath.split(":"):
+                os.environ["CPATH"] = f"{inc}:{cpath}" if cpath else inc
+            return
+
+
+_ensure_cuda_cccl()
 
 _ARCH = tilelang.contrib.nvcc.get_target_compute_version()
 if _ARCH == "9.0":
