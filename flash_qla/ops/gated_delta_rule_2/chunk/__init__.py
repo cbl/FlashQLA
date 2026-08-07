@@ -78,11 +78,8 @@ def chunk_gdn2(
     )
     assert b.shape == g.shape, "b must be per key channel: [B, T, HV, K]."
     assert w.shape == v.shape, "w must be per value channel: [B, T, HV, V]."
-    if tilelang.contrib.nvcc.get_target_compute_version() != "9.0":
-        raise ValueError(
-            "GDN2 kernels currently target SM90 (Hopper) only."
-        )
     raise NotImplementedError(
-        "GDN2 kernels are under construction (M1-M4, see DESIGN_GDR2.md); "
-        "reference implementations live in tests/ref_gdr2.py."
+        "GDN2 kernels are under construction (M1-M4, see DESIGN_GDR2.md; "
+        "SM90/Hopper first); reference implementations live in "
+        "tests/ref_gdr2.py."
     )
