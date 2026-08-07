@@ -307,7 +307,7 @@ def tilelang_kkt_solve_2(
             a: T.Tensor(a_shape, dtype=qkva_dtype),
             attn: T.Tensor(a_shape, dtype=qkva_dtype),
         ):
-            with T.Kernel(num_chunks * H, threads=128) as (bch,):
+            with T.Kernel(num_chunks * H, threads=256) as (bch,):
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 
@@ -351,7 +351,7 @@ def tilelang_kkt_solve_2(
             attn: T.Tensor(a_shape, dtype=qkva_dtype),
             num_chunks: T.int32,
         ):
-            with T.Kernel(num_chunks * H, threads=128) as (bch,):
+            with T.Kernel(num_chunks * H, threads=256) as (bch,):
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 
