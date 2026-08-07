@@ -82,8 +82,10 @@ def tilelang_kkt_solve_2(
         kl_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
         kr_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         arow_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
+        off_shared = T.alloc_shared((block_S, block_S), dtype=accum_dtype)
         a64_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
         diag_acc = T.alloc_fragment((SUB, SUB), dtype=accum_dtype)
+        diag_shared = T.alloc_shared((NSUB, SUB, SUB), dtype=accum_dtype)
 
         a16i_row = T.alloc_fragment((4, 16), dtype=accum_dtype)
         a16i_sum = T.alloc_fragment((4, 16), dtype=accum_dtype)
@@ -133,36 +135,42 @@ def tilelang_kkt_solve_2(
 
         # Off-diagonal sub-blocks: bounded two-factor form, one GEMM per
         # row block. Row block bi covers rows [r, r+16); columns [0, r).
-        for bi in T.serial(1, NSUB):
-            # kl = (b * k) * exp(G - G_r) on the row block (exponent <= 0)
-            for j_s, j_k in T.Parallel(SUB, DK):
-                kl_shared[j_s, j_k] = (
-                    b_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
-                    * k_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
-                    * T.exp2(
-                        (g_shared[bi * SUB + j_s, j_k] - g_shared[bi * SUB, j_k])
-                        * L2E
-                    )
-                ).astype(qkva_dtype)
-            # kr = k * exp(G_r - G) on columns before the block (exponent
-            # <= 0); columns at or past the block zeroed.
-            for j_s, j_k in T.Parallel(block_S, DK):
-                if j_s < bi * SUB:
-                    kr_shared[j_s, j_k] = (
-                        k_shared[j_s, j_k].astype(accum_dtype)
+        for bi in T.serial(NSUB):
+            if bi > 0:
+                # kl = (b * k) * exp(G - G_r) on the row block (exponent <= 0)
+                for j_s, j_k in T.Parallel(SUB, DK):
+                    kl_shared[j_s, j_k] = (
+                        b_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
+                        * k_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
                         * T.exp2(
-                            (g_shared[bi * SUB, j_k] - g_shared[j_s, j_k]) * L2E
+                            (
+                                g_shared[bi * SUB + j_s, j_k]
+                                - g_shared[bi * SUB, j_k]
+                            )
+                            * L2E
                         )
                     ).astype(qkva_dtype)
-                else:
-                    kr_shared[j_s, j_k] = 0
-            T.gemm(
-                kl_shared, kr_shared, arow_fragment,
-                transpose_B=True, clear_accum=True,
-            )
-            for j_s, j_t in T.Parallel(SUB, block_S):
-                if j_t < bi * SUB:
-                    a64_fragment[bi * SUB + j_s, j_t] = arow_fragment[j_s, j_t]
+                # kr = k * exp(G_r - G) on columns before the block (exponent
+                # <= 0); columns at or past the block zeroed.
+                for j_s, j_k in T.Parallel(block_S, DK):
+                    if j_s < bi * SUB:
+                        kr_shared[j_s, j_k] = (
+                            k_shared[j_s, j_k].astype(accum_dtype)
+                            * T.exp2(
+                                (g_shared[bi * SUB, j_k] - g_shared[j_s, j_k])
+                                * L2E
+                            )
+                        ).astype(qkva_dtype)
+                    else:
+                        kr_shared[j_s, j_k] = 0
+                T.gemm(
+                    kl_shared, kr_shared, arow_fragment,
+                    transpose_B=True, clear_accum=True,
+                )
+                # Fragment-to-fragment moves at shifted indices cross thread
+                # ownership and lower to atomics; stage through shared.
+                for j_s, j_t in T.Parallel(SUB, block_S):
+                    off_shared[bi * SUB + j_s, j_t] = arow_fragment[j_s, j_t]
 
         # Diagonal sub-blocks: elementwise with per-pair exponents — the
         # only form bounded for arbitrary gate magnitudes inside a block.
@@ -184,17 +192,21 @@ def tilelang_kkt_solve_2(
                             )
                         )
             for j_s, j_t in T.Parallel(SUB, SUB):
-                if j_s > j_t:
-                    a64_fragment[bi * SUB + j_s, bi * SUB + j_t] = diag_acc[
-                        j_s, j_t
-                    ]
+                diag_shared[bi, j_s, j_t] = diag_acc[j_s, j_t]
 
-        # A = I + StrictLower(A)
+        # Assemble A = I + StrictLower(A): every thread writes only its
+        # own a64_fragment elements, reading from shared.
         for j_s, j_t in T.Parallel(block_S, block_S):
             if j_s < j_t:
                 a64_fragment[j_s, j_t] = 0
             elif j_s == j_t:
                 a64_fragment[j_s, j_t] = 1
+            elif (j_s // SUB) == (j_t // SUB):
+                a64_fragment[j_s, j_t] = diag_shared[
+                    j_s // SUB, j_s % SUB, j_t % SUB
+                ]
+            else:
+                a64_fragment[j_s, j_t] = off_shared[j_s, j_t]
 
         # ------- blocked triangular inversion: identical to gdn -------
         # Prepare inversion input

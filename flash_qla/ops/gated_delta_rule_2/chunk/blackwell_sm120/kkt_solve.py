@@ -75,8 +75,10 @@ def tilelang_kkt_solve_2(
         kl_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
         kr_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         arow_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
+        arow_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
         a32_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
         diag_acc = T.alloc_fragment((SUB, SUB), dtype=accum_dtype)
+        diag_shared = T.alloc_shared((2, SUB, SUB), dtype=accum_dtype)
 
         a16i_row = T.alloc_fragment((2, 16), dtype=accum_dtype)
         a16i_sum = T.alloc_fragment((2, 16), dtype=accum_dtype)
@@ -140,9 +142,9 @@ def tilelang_kkt_solve_2(
             kl_shared, kr_shared, arow_fragment,
             transpose_B=True, clear_accum=True,
         )
-        for j_s, j_t in T.Parallel(SUB, block_S):
-            if j_t < SUB:
-                a32_fragment[SUB + j_s, j_t] = arow_fragment[j_s, j_t]
+        # Fragment-to-fragment moves at shifted indices cross thread
+        # ownership and lower to atomics; route through shared instead.
+        T.copy(arow_fragment, arow_shared)
 
         # Diagonal sub-blocks: elementwise with per-pair exponents.
         for bi in T.serial(2):
@@ -163,17 +165,21 @@ def tilelang_kkt_solve_2(
                             )
                         )
             for j_s, j_t in T.Parallel(SUB, SUB):
-                if j_s > j_t:
-                    a32_fragment[bi * SUB + j_s, bi * SUB + j_t] = diag_acc[
-                        j_s, j_t
-                    ]
+                diag_shared[bi, j_s, j_t] = diag_acc[j_s, j_t]
 
-        # A = I + StrictLower(A)
+        # Assemble A = I + StrictLower(A): every thread writes only its
+        # own a32_fragment elements, reading from shared.
         for j_s, j_t in T.Parallel(block_S, block_S):
             if j_s < j_t:
                 a32_fragment[j_s, j_t] = 0
             elif j_s == j_t:
                 a32_fragment[j_s, j_t] = 1
+            elif (j_s // SUB) == (j_t // SUB):
+                a32_fragment[j_s, j_t] = diag_shared[
+                    j_s // SUB, j_s % SUB, j_t % SUB
+                ]
+            else:
+                a32_fragment[j_s, j_t] = arow_shared[j_s - SUB, j_t]
 
         # ------- 16 -> 32 blocked inversion: identical to gdn sm120 -------
         for j_s, j_t in T.Parallel(block_S, block_S):
