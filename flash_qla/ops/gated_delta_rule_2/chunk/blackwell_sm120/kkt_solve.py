@@ -338,6 +338,7 @@ def kkt_solve(
     INCLUSIVE cumsum of the log decay; b: [B, T, H, K] (same dtype as k).
     Returns a: [B, T, H, chunk_size] in k.dtype.
     """
+    k, g, b = k.contiguous(), g.contiguous(), b.contiguous()
     batch_size, num_tokens, Hg, K = k.shape
     H = b.shape[2]
     assert K == 128
