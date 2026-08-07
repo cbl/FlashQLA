@@ -83,23 +83,25 @@ def bench_kkt_stage(args):
     shapes — a lower bound, since gdn2's A-build does strictly more
     work. An early perf signal available before the full forward (M3)."""
     from flash_qla.ops.gated_delta_rule.chunk import kkt_solve as kkt_gdn
-    from flash_qla.ops.gated_delta_rule_2.chunk import kkt_solve as kkt_gdn2
-    assert kkt_gdn2 is not None, "gdn2 kkt_solve targets SM90 only"
+    from flash_qla.ops.gated_delta_rule_2.chunk import (
+        CHUNK_SIZE_2, kkt_solve as kkt_gdn2,
+    )
+    assert kkt_gdn2 is not None, "gdn2 kkt_solve: unsupported arch"
 
     print(f"kkt stage bench  B={args.batch} hk={args.hk} hv={args.hv} "
-          f"d={args.dim} bf16")
-    print(f"{'seq':>8} {'gdn kkt':>10} {'gdn2 kkt':>10} {'ratio':>6}")
+          f"d={args.dim} bf16  chunk={CHUNK_SIZE_2}")
+    print(f"{'seq':>8} {'floor (gdn kkt)':>16} {'gdn2 kkt':>10} {'ratio':>6}")
     for seq in args.seqlens:
         inputs = make_inputs(args.batch, seq, args.hk, args.hv,
                              args.dim, args.dim)
         k, g, b = inputs["k"], inputs["g"], inputs["b"]
         beta_head = b.float().mean(-1)                 # gdn's scalar beta
-        g_cs = _chunk_cumsum(g.float())
+        g_cs = _chunk_cumsum(g.float(), CHUNK_SIZE_2)
         t_gdn = timeit(lambda: kkt_gdn(k=k, b=beta_head),
                        args.warmup, args.iters)
-        t_gdn2 = timeit(lambda: kkt_gdn2(k, g_cs, b),
+        t_gdn2 = timeit(lambda: kkt_gdn2(k, g_cs, b, chunk_size=CHUNK_SIZE_2),
                         args.warmup, args.iters)
-        print(f"{seq:>8} {t_gdn:9.3f}ms {t_gdn2:9.3f}ms "
+        print(f"{seq:>8} {t_gdn:14.3f}ms {t_gdn2:9.3f}ms "
               f"{t_gdn2 / t_gdn:5.2f}x")
 
 

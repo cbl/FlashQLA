@@ -134,16 +134,16 @@ def _chunk_cumsum(g: torch.Tensor, chunk_size: int = 64) -> torch.Tensor:
 @pytest.mark.parametrize("B,T,Hk,Hv", CONFIGS)
 def test_kkt_solve_2_matches_ref(B, T, Hk, Hv):
     try:
-        from flash_qla.ops.gated_delta_rule_2.chunk import kkt_solve
+        from flash_qla.ops.gated_delta_rule_2.chunk import CHUNK_SIZE_2, kkt_solve
     except Exception as e:  # no CUDA / no tilelang on this machine
         pytest.skip(f"flash_qla unavailable here ({type(e).__name__})")
     if kkt_solve is None:
-        pytest.skip("gdn2 kkt_solve targets SM90 only")
+        pytest.skip("gdn2 kkt_solve: unsupported arch (SM90/SM120 only)")
 
     from ref_gdr2 import _expand_heads, _pad_chunks, ref_kkt_2, ref_solve
 
     q, k, v, g, b, w, h0 = _make_inputs_2(B, T, Hk, Hv)
-    chunk = 64
+    chunk = CHUNK_SIZE_2
     k_bf = k.to(torch.bfloat16)
     b_bf = b.to(torch.bfloat16)
     g_cs = _chunk_cumsum(g.float(), chunk)                     # fp32, kernel input

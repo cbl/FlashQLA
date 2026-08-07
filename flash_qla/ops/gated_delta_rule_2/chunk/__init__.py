@@ -14,12 +14,18 @@ Kernel status (milestones in DESIGN_GDR2.md):
 import torch
 import tilelang
 
-if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
+_ARCH = tilelang.contrib.nvcc.get_target_compute_version()
+if _ARCH == "9.0":
     from .hopper import kkt_solve
+    CHUNK_SIZE_2 = 64
+elif _ARCH == "12.0":
+    from .blackwell_sm120 import kkt_solve
+    CHUNK_SIZE_2 = 32
 else:
-    # GDN2 kernels target SM90 first; other archs see the informative
-    # raise in chunk_gdn2 below rather than an import failure.
+    # Unsupported archs see the informative raise in chunk_gdn2 below
+    # rather than an import failure.
     kkt_solve = None
+    CHUNK_SIZE_2 = None
 
 
 def chunk_gdn2(
