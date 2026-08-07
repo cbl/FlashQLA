@@ -39,6 +39,8 @@ def tilelang_fused_fwd_2(
     g_dtype,
     h_dtype,
     o_dtype,
+    include_intra=True,
+    include_inter=True,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -75,6 +77,7 @@ def tilelang_fused_fwd_2(
             h_shared = T.alloc_shared((DK, DV), dtype=h_dtype)
             ql_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
             kr_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
+            eq_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             attn_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
             off_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
             off_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
@@ -152,14 +155,17 @@ def tilelang_fused_fwd_2(
                 elif (j_s // SUB) < (j_t // SUB):
                     attn_shared[j_s, j_t] = 0
 
-            # o = attn @ R + (e^G * q) @ S  (eq reuses kr_shared)
-            T.gemm(attn_shared, r_shared, o_fragment, clear_accum=True)
+            # o = attn @ R + (e^G * q) @ S
+            T.clear(o_fragment)
+            if include_intra:
+                T.gemm(attn_shared, r_shared, o_fragment, clear_accum=False)
             for j_s, j_k in T.Parallel(block_S, DK):
-                kr_shared[j_s, j_k] = (
+                eq_shared[j_s, j_k] = (
                     q_shared[j_s, j_k].astype(accum_dtype)
                     * T.exp2(g_shared[j_s, j_k] * L2E)
                 ).astype(qkva_dtype)
-            T.gemm(kr_shared, h_shared, o_fragment, clear_accum=False)
+            if include_inter:
+                T.gemm(eq_shared, h_shared, o_fragment, clear_accum=False)
 
             for j_s, j_v in T.Parallel(block_S, DV):
                 if left + j_s < num_tokens:
@@ -177,6 +183,8 @@ def fused_fwd_2(
     r: torch.Tensor,
     h: torch.Tensor,
     scale: Optional[float] = None,
+    include_intra: bool = True,
+    include_inter: bool = True,
 ):
     """Outputs from per-chunk states. q/k: [B, T, Hg, K]; g_cs:
     [B, T, H, K] fp32 chunk-local cumsum; r: [B, T, H, V] from
@@ -206,6 +214,8 @@ def fused_fwd_2(
         g_dtype=g_cs.dtype,
         h_dtype=h.dtype,
         o_dtype=o.dtype,
+        include_intra=include_intra,
+        include_inter=include_inter,
     )
     kernel(q, k, g_cs, r, h, o)
     return o
