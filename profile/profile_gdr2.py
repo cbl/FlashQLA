@@ -27,6 +27,8 @@ def main():
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--bwd", action="store_true")
+    p.add_argument("--table", action="store_true",
+                   help="also print the full per-kernel table")
     p.add_argument("--trace", default=None, metavar="OUT.json")
     args = p.parse_args()
 
@@ -47,8 +49,27 @@ def main():
     ) as prof:
         bench_impl(kernel, inputs, expand_qk, warmup=0,
                    iters=args.iters, bwd=args.bwd)
-    print(prof.key_averages().table(
-        sort_by="self_cuda_time_total", row_limit=25))
+    events = prof.key_averages()
+    buckets = {"kkt": 0.0, "march": 0.0, "fused": 0.0, "other": 0.0}
+    for ev in events:
+        t = getattr(ev, "self_device_time_total",
+                    getattr(ev, "self_cuda_time_total", 0.0))
+        name = ev.key.lower()
+        if "kkt" in name:
+            buckets["kkt"] += t
+        elif "prepare_h" in name:
+            buckets["march"] += t
+        elif "fused_fwd" in name:
+            buckets["fused"] += t
+        else:
+            buckets["other"] += t
+    total = sum(buckets.values()) or 1.0
+    print("-- compact (self GPU time; 'other' = torch precompute/copies) --")
+    for name, t in buckets.items():
+        print(f"{name:6} {t / 1e3:8.2f}ms {100 * t / total:5.1f}%")
+    if args.table:
+        print(prof.key_averages().table(
+            sort_by="self_cuda_time_total", row_limit=25))
     if args.trace:
         prof.export_chrome_trace(args.trace)
         print(f"trace written to {args.trace}")
