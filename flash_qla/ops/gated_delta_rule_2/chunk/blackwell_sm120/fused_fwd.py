@@ -41,6 +41,7 @@ def tilelang_fused_fwd_2(
     o_dtype,
     include_intra=True,
     include_inter=True,
+    store_attn=False,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -62,6 +63,7 @@ def tilelang_fused_fwd_2(
         r: T.Tensor(r_shape, dtype=qkva_dtype),
         h: T.Tensor(h_shape, dtype=h_dtype),
         o: T.Tensor(o_shape, dtype=o_dtype),
+        attn_out: T.Tensor((batch_size, T.dynamic("attn_tokens"), H, chunk_size), dtype=qkva_dtype),
     ):
         with T.Kernel(batch_size * num_chunks * H, threads=128) as (bch,):
             bc, bh = bch // H, bch % H
@@ -79,6 +81,8 @@ def tilelang_fused_fwd_2(
             kr_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             eq_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             attn_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
+            attn_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
+            diag_shared = T.alloc_shared((2, SUB, SUB), dtype=accum_dtype)
             off_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
             off_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
             o_fragment = T.alloc_fragment((block_S, DV), dtype=accum_dtype)
@@ -144,16 +148,21 @@ def tilelang_fused_fwd_2(
                                     * L2E
                                 )
                             )
-                    attn_shared[bi * SUB + j_s, bi * SUB + j_t] = (
-                        diag_local[0]
-                    ).astype(qkva_dtype)
+                    diag_shared[bi, j_s, j_t] = diag_local[0]
             for j_s, j_t in T.Parallel(block_S, block_S):
-                if (j_s // SUB) > (j_t // SUB):
-                    attn_shared[j_s, j_t] = (
-                        off_shared[j_s - SUB, j_t]
-                    ).astype(qkva_dtype)
-                elif (j_s // SUB) < (j_t // SUB):
-                    attn_shared[j_s, j_t] = 0
+                if (j_s // SUB) == (j_t // SUB):
+                    attn_fragment[j_s, j_t] = diag_shared[
+                        j_s // SUB, j_s % SUB, j_t % SUB
+                    ]
+                elif (j_s // SUB) > (j_t // SUB):
+                    attn_fragment[j_s, j_t] = off_shared[j_s - SUB, j_t]
+                else:
+                    attn_fragment[j_s, j_t] = 0
+            T.copy(attn_fragment, attn_shared)
+            if store_attn:
+                for j_s, j_t in T.Parallel(block_S, block_S):
+                    if left + j_s < num_tokens:
+                        attn_out[bb, left + j_s, bh, j_t] = attn_shared[j_s, j_t]
 
             # o = attn @ R + (e^G * q) @ S
             T.clear(o_fragment)
@@ -185,6 +194,7 @@ def fused_fwd_2(
     scale: Optional[float] = None,
     include_intra: bool = True,
     include_inter: bool = True,
+    output_attn: bool = False,
 ):
     """Outputs from per-chunk states. q/k: [B, T, Hg, K]; g_cs:
     [B, T, H, K] fp32 chunk-local cumsum; r: [B, T, H, V] from
@@ -216,6 +226,13 @@ def fused_fwd_2(
         o_dtype=o.dtype,
         include_intra=include_intra,
         include_inter=include_inter,
+        store_attn=output_attn,
     )
-    kernel(q, k, g_cs, r, h, o)
+    attn_out = torch.empty(
+        (batch_size, num_tokens if output_attn else 0, H, 32),
+        dtype=q.dtype, device=q.device,
+    )
+    kernel(q, k, g_cs, r, h, o, attn_out)
+    if output_attn:
+        return o, attn_out
     return o

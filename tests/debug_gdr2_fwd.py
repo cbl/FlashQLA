@@ -72,6 +72,11 @@ def main():
                           include_intra=intra, include_inter=inter)
         print(f"{label}: rel={_rel(o_k, ref.double()):.3e}")
 
+    _, attn_k = fused_fwd_2(q_bf, k_bf, g_cs, r, h, scale, output_attn=True)
+    attn_rows = _pad_chunks(attn_k.float(), chunk)        # [B, N, C, H, C]
+    attn_ref_rows = attn.permute(0, 1, 3, 2, 4)           # [b,n,h,i,j]->[b,n,i,h,j]
+    print(f"attn : rel={_rel(attn_rows.double(), attn_ref_rows.double()):.3e}")
+
     o_ref, _ = chunk_gdn2_fwd_ref(
         q_bf.double(), k_bf.double(), v_bf.double(), g32.double(),
         b_bf.double(), w_bf.double(), initial_state=h0.double(),
