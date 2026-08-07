@@ -61,7 +61,7 @@ def tilelang_fused_fwd_2(
         h: T.Tensor(h_shape, dtype=h_dtype),
         o: T.Tensor(o_shape, dtype=o_dtype),
     ):
-        with T.Kernel(num_chunks * H, threads=128) as (bch,):
+        with T.Kernel(batch_size * num_chunks * H, threads=128) as (bch,):
             bc, bh = bch // H, bch % H
             bhg = bh // (H // Hg)
             bb = bc % batch_size
