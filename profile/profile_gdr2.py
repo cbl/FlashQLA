@@ -50,17 +50,20 @@ def main():
         bench_impl(kernel, inputs, expand_qk, warmup=0,
                    iters=args.iters, bwd=args.bwd)
     events = prof.key_averages()
-    buckets = {"kkt": 0.0, "march": 0.0, "fused": 0.0, "other": 0.0}
+    buckets = {"kkt": 0.0, "march": 0.0, "fused": 0.0, "gcs": 0.0,
+               "other": 0.0}
     for ev in events:
         t = getattr(ev, "self_device_time_total",
                     getattr(ev, "self_cuda_time_total", 0.0))
         name = ev.key.lower()
         if "kkt" in name:
             buckets["kkt"] += t
-        elif "prepare_h" in name:
+        elif "prepare_h" in name or "fused_march" in name:
             buckets["march"] += t
         elif "fused_fwd" in name:
             buckets["fused"] += t
+        elif "gcs" in name:
+            buckets["gcs"] += t
         else:
             buckets["other"] += t
     total = sum(buckets.values()) or 1.0
