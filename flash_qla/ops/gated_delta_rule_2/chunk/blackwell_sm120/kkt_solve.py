@@ -80,7 +80,12 @@ def tilelang_kkt_solve_2(
         attnoff_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
         attnoff_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
         attn_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
-        diagq_shared = T.alloc_shared((2, SUB, SUB), dtype=accum_dtype)
+        klq8_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
+        kr8_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
+        off8_fragment = T.alloc_fragment((block_S, SUB), dtype=accum_dtype)
+        off8_shared = T.alloc_shared((block_S, SUB), dtype=accum_dtype)
+        diag8a_shared = T.alloc_shared((4, 8, 8), dtype=accum_dtype)
+        diag8q_shared = T.alloc_shared((4, 8, 8), dtype=accum_dtype)
         kr_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         arow_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
         arow_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
@@ -88,7 +93,6 @@ def tilelang_kkt_solve_2(
         diag_local = T.alloc_local((1), dtype=accum_dtype)
         diagq_local = T.alloc_local((1), dtype=accum_dtype)
         e_local = T.alloc_local((1), dtype=accum_dtype)
-        diag_shared = T.alloc_shared((2, SUB, SUB), dtype=accum_dtype)
 
         a16i_row = T.alloc_fragment((2, 16), dtype=accum_dtype)
         a16i_sum = T.alloc_fragment((2, 16), dtype=accum_dtype)
@@ -172,41 +176,100 @@ def tilelang_kkt_solve_2(
         )
         T.copy(attnoff_fragment, attnoff_shared)
 
-        # Diagonal sub-blocks: ONE exp2 per (pair, channel) feeds both
-        # the A gram (strict lower) and the attention gram (inclusive).
-        for bi in T.serial(2):
-            for j_s, j_t in T.Parallel(SUB, SUB):
+        # 8-token sub-blocking of the same-16-block work: the hi-half x
+        # lo-half 8x8 quadrants go to tensor cores — BOTH 16-blocks batched
+        # into one m16 gemm per gram (only the two diagonal quadrants of
+        # the [16,16] result are valid and read; the cross quadrants are
+        # finite garbage by construction). Rebase point: the block's row 8.
+        for j_s, j_k in T.Parallel(block_S, DK):
+            if j_s < SUB:
+                klq8_shared[j_s, j_k] = (
+                    b_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
+                    * k_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
+                    * T.exp2(
+                        (
+                            g_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k]
+                            - g_shared[(j_s // 8) * SUB + 8, j_k]
+                        )
+                        * L2E
+                    )
+                ).astype(qkva_dtype)
+            else:
+                klq8_shared[j_s, j_k] = (
+                    q_shared[((j_s - SUB) // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
+                    * T.exp2(
+                        (
+                            g_shared[((j_s - SUB) // 8) * SUB + 8 + (j_s % 8), j_k]
+                            - g_shared[((j_s - SUB) // 8) * SUB + 8, j_k]
+                        )
+                        * L2E
+                    )
+                ).astype(qkva_dtype)
+        for j_s, j_k in T.Parallel(SUB, DK):
+            kr8_shared[j_s, j_k] = (
+                k_shared[(j_s // 8) * SUB + (j_s % 8), j_k].astype(accum_dtype)
+                * T.exp2(
+                    (
+                        g_shared[(j_s // 8) * SUB + 8, j_k]
+                        - g_shared[(j_s // 8) * SUB + (j_s % 8), j_k]
+                    )
+                    * L2E
+                )
+            ).astype(qkva_dtype)
+        T.gemm(
+            klq8_shared, kr8_shared, off8_fragment,
+            transpose_B=True, clear_accum=True,
+        )
+        T.copy(off8_fragment, off8_shared)
+
+        # The four 8x8 diagonals stay elementwise (no bounded factoring
+        # exists inside a block) — 47% fewer pairs than 16x16 diagonals,
+        # one exp2 feeding both grams, strip-unrolled channel loop.
+        for b8 in T.serial(4):
+            for j_s, j_t in T.Parallel(8, 8):
                 diag_local[0] = 0.0
                 diagq_local[0] = 0.0
                 if j_s >= j_t:
-                    for j_k in T.serial(DK):
-                        e_local[0] = T.exp2(
-                            (
-                                g_shared[bi * SUB + j_s, j_k]
-                                - g_shared[bi * SUB + j_t, j_k]
+                    for j_ko in T.serial(8):
+                        for j_ki in T.unroll(16):
+                            e_local[0] = T.exp2(
+                                (
+                                    g_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                             j_ko * 16 + j_ki]
+                                    - g_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_t,
+                                               j_ko * 16 + j_ki]
+                                )
+                                * L2E
+                            ) * k_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_t,
+                                         j_ko * 16 + j_ki].astype(accum_dtype)
+                            diagq_local[0] += (
+                                q_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                         j_ko * 16 + j_ki].astype(accum_dtype)
+                                * e_local[0]
                             )
-                            * L2E
-                        ) * k_shared[bi * SUB + j_t, j_k].astype(accum_dtype)
-                        diagq_local[0] += (
-                            q_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
-                            * e_local[0]
-                        )
-                        diag_local[0] += (
-                            b_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
-                            * k_shared[bi * SUB + j_s, j_k].astype(accum_dtype)
-                            * e_local[0]
-                        )
+                            diag_local[0] += (
+                                b_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                         j_ko * 16 + j_ki].astype(accum_dtype)
+                                * k_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                           j_ko * 16 + j_ki].astype(accum_dtype)
+                                * e_local[0]
+                            )
                 if j_s > j_t:
-                    diag_shared[bi, j_s, j_t] = diag_local[0]
+                    diag8a_shared[b8, j_s, j_t] = diag_local[0]
                 else:
-                    diag_shared[bi, j_s, j_t] = 0.0
-                diagq_shared[bi, j_s, j_t] = diagq_local[0]
+                    diag8a_shared[b8, j_s, j_t] = 0.0
+                diag8q_shared[b8, j_s, j_t] = diagq_local[0]
 
         # Assemble and store the attention matrix (inclusive tril).
         for j_s, j_t in T.Parallel(block_S, block_S):
-            if (j_s // SUB) == (j_t // SUB):
-                attn_fragment[j_s, j_t] = diagq_shared[
-                    j_s // SUB, j_s % SUB, j_t % SUB
+            if (j_s // 8) == (j_t // 8):
+                attn_fragment[j_s, j_t] = diag8q_shared[
+                    j_s // 8, j_s % 8, j_t % 8
+                ]
+            elif ((j_s // SUB) == (j_t // SUB)) and ((j_s // 8) > (j_t // 8)):
+                attn_fragment[j_s, j_t] = off8_shared[
+                    SUB + (j_s // SUB) * 8 + (j_s % SUB) - 8,
+                    (j_t // SUB) * 8 + (j_t % SUB),
                 ]
             elif (j_s // SUB) > (j_t // SUB):
                 attn_fragment[j_s, j_t] = attnoff_shared[j_s - SUB, j_t]
@@ -227,9 +290,14 @@ def tilelang_kkt_solve_2(
                 a32_fragment[j_s, j_t] = 0
             elif j_s == j_t:
                 a32_fragment[j_s, j_t] = 1
+            elif (j_s // 8) == (j_t // 8):
+                a32_fragment[j_s, j_t] = diag8a_shared[
+                    j_s // 8, j_s % 8, j_t % 8
+                ]
             elif (j_s // SUB) == (j_t // SUB):
-                a32_fragment[j_s, j_t] = diag_shared[
-                    j_s // SUB, j_s % SUB, j_t % SUB
+                a32_fragment[j_s, j_t] = off8_shared[
+                    (j_s // SUB) * 8 + (j_s % SUB) - 8,
+                    (j_t // SUB) * 8 + (j_t % SUB),
                 ]
             else:
                 a32_fragment[j_s, j_t] = arow_shared[j_s - SUB, j_t]
