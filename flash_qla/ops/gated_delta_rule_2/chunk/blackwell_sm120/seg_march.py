@@ -110,6 +110,11 @@ def tilelang_seg_march_2(
 
             tx = T.get_thread_binding()
 
+            my_chunks = T.alloc_var("int32")
+            my_chunks = num_chunks - seg * seg_chunks
+            if my_chunks > seg_chunks:
+                my_chunks = seg_chunks
+
             if tx < 128:
                 if mode == "zero":
                     if use_h0:
@@ -133,80 +138,79 @@ def tilelang_seg_march_2(
                         src_state[bb, seg, bh, 0:DK, vo:vo + DVS], s_fragment
                     )
 
-                for i_s in T.serial(seg_chunks):
-                    if seg * seg_chunks + i_s < num_chunks:
-                        st = i_s % NS
-                        T.barrier_wait(data_is_ready[st], (i_s // NS + 0) % 2)
+                for i_s in T.serial(my_chunks):
+                    st = i_s % NS
+                    T.barrier_wait(data_is_ready[st], (i_s // NS + 0) % 2)
 
-                        left = (seg * seg_chunks + i_s) * block_S
-                        T.copy(s_fragment, s_shared)
-                        T.barrier_arrive(bar_s)
-                        T.barrier_wait(bar_s, i_s % 2)
+                    left = (seg * seg_chunks + i_s) * block_S
+                    T.copy(s_fragment, s_shared)
+                    T.barrier_arrive(bar_s)
+                    T.barrier_wait(bar_s, i_s % 2)
 
+                    T.gemm(
+                        ekb_shared[st, :, :], s_shared, u_fragment,
+                        clear_accum=True,
+                    )
+                    if mode == "zero":
+                        for j_s, j_v in T.Parallel(block_S, DVS):
+                            u_fragment[j_s, j_v] = (
+                                mv_shared[st, j_s, j_v].astype(accum_dtype)
+                                - u_fragment[j_s, j_v]
+                            )
+                    else:
+                        for j_s, j_v in T.Parallel(block_S, DVS):
+                            u_fragment[j_s, j_v] = -u_fragment[j_s, j_v]
+                    T.copy(u_fragment, ymu_shared)
+                    T.barrier_arrive(bar_ymu)
+                    T.barrier_wait(bar_ymu, i_s % 2)
+
+                    T.gemm(
+                        a_shared[st, :, :], ymu_shared, r_fragment,
+                        clear_accum=True,
+                    )
+                    T.copy(r_fragment, r_shared)
+                    T.barrier_arrive(bar_r)
+                    T.barrier_wait(bar_r, i_s % 2)
+
+                    if mode != "homo":
+                        T.clear(o_fragment)
                         T.gemm(
-                            ekb_shared[st, :, :], s_shared, u_fragment,
-                            clear_accum=True,
+                            attn_shared[st, :, :], r_shared, o_fragment,
+                            clear_accum=False,
+                        )
+                        T.gemm(
+                            eq_shared[st, :, :], s_shared, o_fragment,
+                            clear_accum=False,
                         )
                         if mode == "zero":
                             for j_s, j_v in T.Parallel(block_S, DVS):
-                                u_fragment[j_s, j_v] = (
-                                    mv_shared[st, j_s, j_v].astype(accum_dtype)
-                                    - u_fragment[j_s, j_v]
-                                )
+                                if left + j_s < num_tokens:
+                                    o[bb, left + j_s, bh, vo + j_v] = (
+                                        o_fragment[j_s, j_v] * scale
+                                    ).astype(o_dtype)
                         else:
                             for j_s, j_v in T.Parallel(block_S, DVS):
-                                u_fragment[j_s, j_v] = -u_fragment[j_s, j_v]
-                        T.copy(u_fragment, ymu_shared)
-                        T.barrier_arrive(bar_ymu)
-                        T.barrier_wait(bar_ymu, i_s % 2)
+                                if left + j_s < num_tokens:
+                                    u_fragment[j_s, j_v] = o[
+                                        bb, left + j_s, bh, vo + j_v
+                                    ].astype(accum_dtype)
+                                else:
+                                    u_fragment[j_s, j_v] = 0.0
+                            for j_s, j_v in T.Parallel(block_S, DVS):
+                                if left + j_s < num_tokens:
+                                    o[bb, left + j_s, bh, vo + j_v] = (
+                                        u_fragment[j_s, j_v]
+                                        + o_fragment[j_s, j_v] * scale
+                                    ).astype(o_dtype)
 
-                        T.gemm(
-                            a_shared[st, :, :], ymu_shared, r_fragment,
-                            clear_accum=True,
-                        )
-                        T.copy(r_fragment, r_shared)
-                        T.barrier_arrive(bar_r)
-                        T.barrier_wait(bar_r, i_s % 2)
+                    for j_k, j_v in T.Parallel(DK, DVS):
+                        s_fragment[j_k, j_v] *= glast_shared[st, j_k]
+                    T.gemm(
+                        kte_shared[st, :, :], r_shared, s_fragment,
+                        transpose_A=True, clear_accum=False,
+                    )
 
-                        if mode != "homo":
-                            T.clear(o_fragment)
-                            T.gemm(
-                                attn_shared[st, :, :], r_shared, o_fragment,
-                                clear_accum=False,
-                            )
-                            T.gemm(
-                                eq_shared[st, :, :], s_shared, o_fragment,
-                                clear_accum=False,
-                            )
-                            if mode == "zero":
-                                for j_s, j_v in T.Parallel(block_S, DVS):
-                                    if left + j_s < num_tokens:
-                                        o[bb, left + j_s, bh, vo + j_v] = (
-                                            o_fragment[j_s, j_v] * scale
-                                        ).astype(o_dtype)
-                            else:
-                                for j_s, j_v in T.Parallel(block_S, DVS):
-                                    if left + j_s < num_tokens:
-                                        u_fragment[j_s, j_v] = o[
-                                            bb, left + j_s, bh, vo + j_v
-                                        ].astype(accum_dtype)
-                                    else:
-                                        u_fragment[j_s, j_v] = 0.0
-                                for j_s, j_v in T.Parallel(block_S, DVS):
-                                    if left + j_s < num_tokens:
-                                        o[bb, left + j_s, bh, vo + j_v] = (
-                                            u_fragment[j_s, j_v]
-                                            + o_fragment[j_s, j_v] * scale
-                                        ).astype(o_dtype)
-
-                        for j_k, j_v in T.Parallel(DK, DVS):
-                            s_fragment[j_k, j_v] *= glast_shared[st, j_k]
-                        T.gemm(
-                            kte_shared[st, :, :], r_shared, s_fragment,
-                            transpose_A=True, clear_accum=False,
-                        )
-
-                        T.barrier_arrive(data_is_free[st])
+                    T.barrier_arrive(data_is_free[st])
 
                 if mode != "corr":
                     T.copy(
@@ -214,50 +218,49 @@ def tilelang_seg_march_2(
                     )
 
             else:
-                for i_s in T.serial(seg_chunks):
-                    if seg * seg_chunks + i_s < num_chunks:
-                        st = i_s % NS
-                        T.barrier_wait(data_is_free[st], (i_s // NS + 1) % 2)
+                for i_s in T.serial(my_chunks):
+                    st = i_s % NS
+                    T.barrier_wait(data_is_free[st], (i_s // NS + 1) % 2)
 
-                        left = (seg * seg_chunks + i_s) * block_S
-                        for j_k in T.Parallel(DK):
-                            glast_shared[st, j_k] = gend[
-                                bb, seg * seg_chunks + i_s, bh, j_k
-                            ]
+                    left = (seg * seg_chunks + i_s) * block_S
+                    for j_k in T.Parallel(DK):
+                        glast_shared[st, j_k] = gend[
+                            bb, seg * seg_chunks + i_s, bh, j_k
+                        ]
+                    for j_s, j_k in T.Parallel(block_S, DK):
+                        if left + j_s < num_tokens:
+                            ekb_shared[st, j_s, j_k] = ekb[bb, left + j_s, bh, j_k]
+                            kte_shared[st, j_s, j_k] = kte[bb, left + j_s, bh, j_k]
+                        else:
+                            ekb_shared[st, j_s, j_k] = 0
+                            kte_shared[st, j_s, j_k] = 0
+                    if mode != "homo":
                         for j_s, j_k in T.Parallel(block_S, DK):
                             if left + j_s < num_tokens:
-                                ekb_shared[st, j_s, j_k] = ekb[bb, left + j_s, bh, j_k]
-                                kte_shared[st, j_s, j_k] = kte[bb, left + j_s, bh, j_k]
+                                eq_shared[st, j_s, j_k] = eq[bb, left + j_s, bh, j_k]
                             else:
-                                ekb_shared[st, j_s, j_k] = 0
-                                kte_shared[st, j_s, j_k] = 0
-                        if mode != "homo":
-                            for j_s, j_k in T.Parallel(block_S, DK):
-                                if left + j_s < num_tokens:
-                                    eq_shared[st, j_s, j_k] = eq[bb, left + j_s, bh, j_k]
-                                else:
-                                    eq_shared[st, j_s, j_k] = 0
-                            for j_s, j_t in T.Parallel(block_S, block_S):
-                                if left + j_s < num_tokens:
-                                    attn_shared[st, j_s, j_t] = attn[bb, left + j_s, bh, j_t]
-                                else:
-                                    attn_shared[st, j_s, j_t] = 0
-                        if mode == "zero":
-                            for j_s, j_v in T.Parallel(block_S, DVS):
-                                if left + j_s < num_tokens:
-                                    mv_shared[st, j_s, j_v] = (
-                                        w[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
-                                        * v[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
-                                    ).astype(qkva_dtype)
-                                else:
-                                    mv_shared[st, j_s, j_v] = 0
+                                eq_shared[st, j_s, j_k] = 0
                         for j_s, j_t in T.Parallel(block_S, block_S):
                             if left + j_s < num_tokens:
-                                a_shared[st, j_s, j_t] = a[bb, left + j_s, bh, j_t]
+                                attn_shared[st, j_s, j_t] = attn[bb, left + j_s, bh, j_t]
                             else:
-                                a_shared[st, j_s, j_t] = 0
+                                attn_shared[st, j_s, j_t] = 0
+                    if mode == "zero":
+                        for j_s, j_v in T.Parallel(block_S, DVS):
+                            if left + j_s < num_tokens:
+                                mv_shared[st, j_s, j_v] = (
+                                    w[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
+                                    * v[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
+                                ).astype(qkva_dtype)
+                            else:
+                                mv_shared[st, j_s, j_v] = 0
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        if left + j_s < num_tokens:
+                            a_shared[st, j_s, j_t] = a[bb, left + j_s, bh, j_t]
+                        else:
+                            a_shared[st, j_s, j_t] = 0
 
-                        T.barrier_arrive(data_is_ready[st])
+                    T.barrier_arrive(data_is_ready[st])
 
     return tilelang_seg_march_2_kernel
 

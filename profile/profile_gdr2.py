@@ -60,7 +60,8 @@ def main():
             buckets["gram"] += t
         elif "kkt" in name:
             buckets["kkt"] += t
-        elif "prepare_h" in name or "fused_march" in name:
+        elif ("prepare_h" in name or "fused_march" in name
+              or "seg_march" in name):
             buckets["march"] += t
         elif "fused_fwd" in name:
             buckets["fused"] += t
