@@ -187,9 +187,15 @@ def tilelang_seg_march_2(
                             else:
                                 for j_s, j_v in T.Parallel(block_S, DVS):
                                     if left + j_s < num_tokens:
+                                        u_fragment[j_s, j_v] = o[
+                                            bb, left + j_s, bh, vo + j_v
+                                        ].astype(accum_dtype)
+                                    else:
+                                        u_fragment[j_s, j_v] = 0.0
+                                for j_s, j_v in T.Parallel(block_S, DVS):
+                                    if left + j_s < num_tokens:
                                         o[bb, left + j_s, bh, vo + j_v] = (
-                                            o[bb, left + j_s, bh, vo + j_v]
-                                            .astype(accum_dtype)
+                                            u_fragment[j_s, j_v]
                                             + o_fragment[j_s, j_v] * scale
                                         ).astype(o_dtype)
 
