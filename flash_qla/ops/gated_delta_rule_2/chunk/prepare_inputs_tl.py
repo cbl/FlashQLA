@@ -254,47 +254,55 @@ def tilelang_prepare_inputs_2b(
             gcs_shared = T.alloc_shared((block_S, DK), dtype=accum_dtype)
             qn_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             kn_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
+            norms_shared = T.alloc_shared((2 * block_S), dtype=accum_dtype,
+                                          scope="shared")
             acc = T.alloc_local((1), dtype=accum_dtype)
             nrm = T.alloc_local((1), dtype=accum_dtype)
 
-            # L2-normalize q/k rows (or plain copy) into shared.
-            for rr in T.Parallel(2 * block_S):
-                nrm[0] = 0.0
-                if do_l2norm:
-                    for j_k in T.serial(DK):
-                        if left + rr % block_S < num_tokens:
-                            if rr < block_S:
-                                nrm[0] += (
-                                    q[bb, left + rr, bhg, j_k].astype(accum_dtype)
-                                    * q[bb, left + rr, bhg, j_k].astype(accum_dtype)
-                                )
-                            else:
-                                nrm[0] += (
-                                    k[bb, left + rr - block_S, bhg, j_k].astype(accum_dtype)
-                                    * k[bb, left + rr - block_S, bhg, j_k].astype(accum_dtype)
-                                )
-                    nrm[0] = T.rsqrt(nrm[0] + 1e-6)
+            # Coalesced tile loads FIRST; all per-row/per-channel scans
+            # then run over shared memory (never serial global chains).
+            for j_s, j_k in T.Parallel(block_S, DK):
+                if left + j_s < num_tokens:
+                    qn_shared[j_s, j_k] = q[bb, left + j_s, bhg, j_k]
+                    kn_shared[j_s, j_k] = k[bb, left + j_s, bhg, j_k]
+                    gcs_shared[j_s, j_k] = g[bb, left + j_s, bh, j_k].astype(
+                        accum_dtype
+                    )
                 else:
-                    nrm[0] = 1.0
-                for j_k in T.serial(DK):
-                    if left + rr % block_S < num_tokens:
-                        if rr < block_S:
-                            qn_shared[rr, j_k] = (
-                                q[bb, left + rr, bhg, j_k].astype(accum_dtype)
-                                * nrm[0]
-                            ).astype(qkva_dtype)
-                        else:
-                            kn_shared[rr - block_S, j_k] = (
-                                k[bb, left + rr - block_S, bhg, j_k].astype(accum_dtype)
-                                * nrm[0]
-                            ).astype(qkva_dtype)
+                    qn_shared[j_s, j_k] = 0
+                    kn_shared[j_s, j_k] = 0
+                    gcs_shared[j_s, j_k] = 0.0
 
-            # Per-channel inclusive cumsum of the log decay.
+            if do_l2norm:
+                for rr in T.Parallel(2 * block_S):
+                    nrm[0] = 0.0
+                    for j_k in T.serial(DK):
+                        if rr < block_S:
+                            nrm[0] += (
+                                qn_shared[rr, j_k].astype(accum_dtype)
+                                * qn_shared[rr, j_k].astype(accum_dtype)
+                            )
+                        else:
+                            nrm[0] += (
+                                kn_shared[rr - block_S, j_k].astype(accum_dtype)
+                                * kn_shared[rr - block_S, j_k].astype(accum_dtype)
+                            )
+                    norms_shared[rr] = T.rsqrt(nrm[0] + 1e-6)
+                for j_s, j_k in T.Parallel(block_S, DK):
+                    qn_shared[j_s, j_k] = (
+                        qn_shared[j_s, j_k].astype(accum_dtype)
+                        * norms_shared[j_s]
+                    ).astype(qkva_dtype)
+                    kn_shared[j_s, j_k] = (
+                        kn_shared[j_s, j_k].astype(accum_dtype)
+                        * norms_shared[block_S + j_s]
+                    ).astype(qkva_dtype)
+
+            # Per-channel inclusive cumsum, in place over shared.
             for j_k in T.Parallel(DK):
                 acc[0] = 0.0
                 for j_s in T.serial(block_S):
-                    if left + j_s < num_tokens:
-                        acc[0] += g[bb, left + j_s, bh, j_k].astype(accum_dtype)
+                    acc[0] += gcs_shared[j_s, j_k]
                     gcs_shared[j_s, j_k] = acc[0]
 
             # Outputs. qn/kn written once per head-group (leader head).
