@@ -147,3 +147,60 @@ def prepare_inputs_2_fused(
     )
     kernel(q, k, v, g, b, w, g_cs, eq, ekb, kte, mv, gend)
     return g_cs, eq, ekb, kte, mv, gend
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_gcs_2(
+    H,
+    DK,
+    chunk_size,
+    accum_dtype,
+    g_in_dtype,
+):
+    batch_size = T.dynamic("batch_size")
+    num_tokens = T.dynamic("num_tokens")
+    block_S = chunk_size
+
+    x_in = (batch_size, num_tokens, H, DK)
+    x_out = (batch_size, num_tokens, H, DK)
+
+    @T.prim_func
+    def tilelang_gcs_2_kernel(
+        g: T.Tensor(x_in, dtype=g_in_dtype),
+        g_cs: T.Tensor(x_out, dtype=accum_dtype),
+        num_chunks: T.int32,
+    ):
+        with T.Kernel(batch_size * num_chunks * H, threads=128) as (bch,):
+            bc, bh = bch // H, bch % H
+            bb = bc % batch_size
+            chunk_idx = bc // batch_size
+            left = chunk_idx * block_S
+
+            acc = T.alloc_local((1), dtype=accum_dtype)
+            for j_k in T.Parallel(DK):
+                acc[0] = 0.0
+                for j_s in T.serial(block_S):
+                    if left + j_s < num_tokens:
+                        acc[0] += g[bb, left + j_s, bh, j_k].astype(accum_dtype)
+                        g_cs[bb, left + j_s, bh, j_k] = acc[0]
+
+    return tilelang_gcs_2_kernel
+
+
+def gcs_2(g: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    """Chunk-local inclusive cumsum of the log decay, fp32."""
+    g = g.contiguous()
+    batch_size, num_tokens, H, K = g.shape
+    num_chunks = tilelang.cdiv(num_tokens, chunk_size)
+    g_cs = torch.empty(
+        (batch_size, num_tokens, H, K), dtype=torch.float32, device=g.device
+    )
+    kernel = tilelang_gcs_2(
+        H, K, chunk_size, accum_dtype="float32", g_in_dtype=g.dtype
+    )
+    kernel(g, g_cs, num_chunks)
+    return g_cs

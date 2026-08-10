@@ -87,11 +87,15 @@ if _ARCH == "9.0":
     from .hopper import kkt_solve
     prepare_h_2 = None  # hopper port pending (sm120-first development)
     fused_fwd_2 = None
+    fused_march_2 = None
+    gcs_2 = None
     CHUNK_SIZE_2 = 64
 elif _ARCH == "12.0":
     from .blackwell_sm120 import kkt_solve
     from .blackwell_sm120.prepare_h import prepare_h_2
     from .blackwell_sm120.fused_fwd import fused_fwd_2
+    from .blackwell_sm120.fused_march import fused_march_2
+    from .prepare_inputs_tl import gcs_2
     CHUNK_SIZE_2 = 32
 else:
     # Unsupported archs see the informative raise in chunk_gdn2 below
@@ -99,6 +103,8 @@ else:
     kkt_solve = None
     prepare_h_2 = None
     fused_fwd_2 = None
+    fused_march_2 = None
+    gcs_2 = None
     CHUNK_SIZE_2 = None
 
 
@@ -175,13 +181,13 @@ def chunk_gdn2(
         q, _ = l2norm_fwd(q)
         k, _ = l2norm_fwd(k)
 
-    g_cs, eq, ekb, kte, mv, gend = _prepare_inputs(q, k, v, g, b, w, CHUNK_SIZE_2)
-    a, attn = kkt_solve(k, g_cs, b.to(k.dtype), q, chunk_size=CHUNK_SIZE_2)
-    h, ht, r = prepare_h_2(
-        ekb, kte, mv, a, gend,
+    b = b.to(k.dtype)
+    w = w.to(v.dtype)
+    g_cs = gcs_2(g, CHUNK_SIZE_2)
+    a, attn = kkt_solve(k, g_cs, b, q, chunk_size=CHUNK_SIZE_2)
+    o, ht = fused_march_2(
+        q, k, v, g_cs, b, w, a, attn, scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        output_h=True,
     )
-    o = fused_fwd_2(eq, attn, r, h, scale)
     return o, ht
