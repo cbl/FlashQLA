@@ -91,6 +91,7 @@ if _ARCH == "9.0":
     gcs_2 = None
     prepare_inputs_2b = None
     prefold_gram_2 = None
+    seg_march_2 = None
     CHUNK_SIZE_2 = 64
 elif _ARCH == "12.0":
     from .blackwell_sm120 import kkt_solve
@@ -98,6 +99,7 @@ elif _ARCH == "12.0":
     from .blackwell_sm120.fused_fwd import fused_fwd_2
     from .blackwell_sm120.fused_march import fused_march_2
     from .blackwell_sm120.prefold_gram import prefold_gram_2
+    from .blackwell_sm120.seg_march import seg_march_2
     from .prepare_inputs_tl import gcs_2, prepare_inputs_2b
     CHUNK_SIZE_2 = 32
 else:
@@ -110,6 +112,7 @@ else:
     gcs_2 = None
     prepare_inputs_2b = None
     prefold_gram_2 = None
+    seg_march_2 = None
     CHUNK_SIZE_2 = None
 
 
@@ -186,9 +189,19 @@ def chunk_gdn2(
         q, k, g, b, chunk_size=CHUNK_SIZE_2,
         do_l2norm=use_qk_l2norm_in_kernel,
     )
-    o, ht = fused_march_2(
-        ekb, kte, eq, v, w, gend, a, attn, scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-    )
+    num_chunks = -(-q.shape[1] // CHUNK_SIZE_2)
+    segs = int(os.environ.get("FLASHQLA_SEGMENTS", "8"))
+    if segs > 1 and num_chunks >= 2 * segs:
+        o, ht = seg_march_2(
+            ekb, kte, eq, v, w, gend, a, attn, scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            num_segments=segs,
+        )
+    else:
+        o, ht = fused_march_2(
+            ekb, kte, eq, v, w, gend, a, attn, scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
     return o, ht
