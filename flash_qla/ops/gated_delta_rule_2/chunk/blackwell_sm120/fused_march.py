@@ -18,6 +18,7 @@ operands from raw tensors into double-buffered stages, so folding cost
 hides under compute. Barrier pattern mirrors the gdn prepare_h kernel.
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -265,7 +266,7 @@ def fused_march_2(
         o_dtype=o.dtype,
         use_initial_state=use_initial_state,
         store_final_state=output_final_state,
-        v_split=4,
+        v_split=int(os.environ.get("FLASHQLA_MARCH_VSPLIT", "4")),
     )
     num_chunks = tilelang.cdiv(num_tokens, chunk_size)
     kernel(ekb, kte, eq, mv, gend, a, attn, initial_state, o, ht, num_chunks)

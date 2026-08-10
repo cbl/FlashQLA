@@ -38,6 +38,10 @@ def tilelang_kkt_solve_2(
     g_dtype,
     seqlen_dtype,
     is_varlen,
+    skip_off16=False,
+    skip_off8=False,
+    skip_diag8=False,
+    skip_inv=False,
 ):
     data_batch_size = T.dynamic("data_batch_size")
     real_batch_size = T.dynamic("real_batch_size")
@@ -136,129 +140,133 @@ def tilelang_kkt_solve_2(
 
         T.clear(a32_fragment)
 
-        # Off-diagonal sub-block (rows 16..31 vs cols 0..15): bounded
-        # two-factor form rebased at the row-block start r = 16.
-        for j_s, j_k in T.Parallel(SUB, DK):
-            kl_shared[j_s, j_k] = (
-                b_shared[SUB + j_s, j_k].astype(accum_dtype)
-                * k_shared[SUB + j_s, j_k].astype(accum_dtype)
-                * T.exp2(
-                    (g_shared[SUB + j_s, j_k] - g_shared[SUB, j_k]) * L2E
-                )
-            ).astype(qkva_dtype)
-        for j_s, j_k in T.Parallel(block_S, DK):
-            if j_s < SUB:
-                kr_shared[j_s, j_k] = (
-                    k_shared[j_s, j_k].astype(accum_dtype)
-                    * T.exp2((g_shared[SUB, j_k] - g_shared[j_s, j_k]) * L2E)
-                ).astype(qkva_dtype)
-            else:
-                kr_shared[j_s, j_k] = 0
-        T.gemm(
-            kl_shared, kr_shared, arow_fragment,
-            transpose_B=True, clear_accum=True,
-        )
-        # Fragment-to-fragment moves at shifted indices cross thread
-        # ownership and lower to atomics; route through shared instead.
-        T.copy(arow_fragment, arow_shared)
-
-        # Off-diagonal ATTENTION block: same kr factor, q on the rows.
-        for j_s, j_k in T.Parallel(SUB, DK):
-            ql_shared[j_s, j_k] = (
-                q_shared[SUB + j_s, j_k].astype(accum_dtype)
-                * T.exp2(
-                    (g_shared[SUB + j_s, j_k] - g_shared[SUB, j_k]) * L2E
-                )
-            ).astype(qkva_dtype)
-        T.gemm(
-            ql_shared, kr_shared, attnoff_fragment,
-            transpose_B=True, clear_accum=True,
-        )
-        T.copy(attnoff_fragment, attnoff_shared)
-
-        # 8-token sub-blocking of the same-16-block work: the hi-half x
-        # lo-half 8x8 quadrants go to tensor cores — BOTH 16-blocks batched
-        # into one m16 gemm per gram (only the two diagonal quadrants of
-        # the [16,16] result are valid and read; the cross quadrants are
-        # finite garbage by construction). Rebase point: the block's row 8.
-        for j_s, j_k in T.Parallel(block_S, DK):
-            if j_s < SUB:
-                klq8_shared[j_s, j_k] = (
-                    b_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
-                    * k_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
+        if not skip_off16:
+            # Off-diagonal sub-block (rows 16..31 vs cols 0..15): bounded
+            # two-factor form rebased at the row-block start r = 16.
+            for j_s, j_k in T.Parallel(SUB, DK):
+                kl_shared[j_s, j_k] = (
+                    b_shared[SUB + j_s, j_k].astype(accum_dtype)
+                    * k_shared[SUB + j_s, j_k].astype(accum_dtype)
                     * T.exp2(
-                        (
-                            g_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k]
-                            - g_shared[(j_s // 8) * SUB + 8, j_k]
-                        )
-                        * L2E
+                        (g_shared[SUB + j_s, j_k] - g_shared[SUB, j_k]) * L2E
                     )
                 ).astype(qkva_dtype)
-            else:
-                klq8_shared[j_s, j_k] = (
-                    q_shared[((j_s - SUB) // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
-                    * T.exp2(
-                        (
-                            g_shared[((j_s - SUB) // 8) * SUB + 8 + (j_s % 8), j_k]
-                            - g_shared[((j_s - SUB) // 8) * SUB + 8, j_k]
-                        )
-                        * L2E
-                    )
-                ).astype(qkva_dtype)
-        for j_s, j_k in T.Parallel(SUB, DK):
-            kr8_shared[j_s, j_k] = (
-                k_shared[(j_s // 8) * SUB + (j_s % 8), j_k].astype(accum_dtype)
-                * T.exp2(
-                    (
-                        g_shared[(j_s // 8) * SUB + 8, j_k]
-                        - g_shared[(j_s // 8) * SUB + (j_s % 8), j_k]
-                    )
-                    * L2E
-                )
-            ).astype(qkva_dtype)
-        T.gemm(
-            klq8_shared, kr8_shared, off8_fragment,
-            transpose_B=True, clear_accum=True,
-        )
-        T.copy(off8_fragment, off8_shared)
-
-        # The four 8x8 diagonals stay elementwise (no bounded factoring
-        # exists inside a block) — 47% fewer pairs than 16x16 diagonals,
-        # one exp2 feeding both grams, strip-unrolled channel loop.
-        for b8 in T.serial(4):
-            for j_s, j_t in T.Parallel(8, 8):
-                diag_local[0] = 0.0
-                diagq_local[0] = 0.0
-                if j_s >= j_t:
-                    for j_ko in T.serial(8):
-                        for j_ki in T.unroll(16):
-                            e_local[0] = T.exp2(
-                                (
-                                    g_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
-                                             j_ko * 16 + j_ki]
-                                    - g_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_t,
-                                               j_ko * 16 + j_ki]
-                                )
-                                * L2E
-                            ) * k_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_t,
-                                         j_ko * 16 + j_ki].astype(accum_dtype)
-                            diagq_local[0] += (
-                                q_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
-                                         j_ko * 16 + j_ki].astype(accum_dtype)
-                                * e_local[0]
-                            )
-                            diag_local[0] += (
-                                b_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
-                                         j_ko * 16 + j_ki].astype(accum_dtype)
-                                * k_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
-                                           j_ko * 16 + j_ki].astype(accum_dtype)
-                                * e_local[0]
-                            )
-                if j_s > j_t:
-                    diag8a_shared[b8, j_s, j_t] = diag_local[0]
+            for j_s, j_k in T.Parallel(block_S, DK):
+                if j_s < SUB:
+                    kr_shared[j_s, j_k] = (
+                        k_shared[j_s, j_k].astype(accum_dtype)
+                        * T.exp2((g_shared[SUB, j_k] - g_shared[j_s, j_k]) * L2E)
+                    ).astype(qkva_dtype)
                 else:
-                    diag8a_shared[b8, j_s, j_t] = 0.0
-                diag8q_shared[b8, j_s, j_t] = diagq_local[0]
+                    kr_shared[j_s, j_k] = 0
+            T.gemm(
+                kl_shared, kr_shared, arow_fragment,
+                transpose_B=True, clear_accum=True,
+            )
+            # Fragment-to-fragment moves at shifted indices cross thread
+            # ownership and lower to atomics; route through shared instead.
+            T.copy(arow_fragment, arow_shared)
+
+        if not skip_off16:
+            # Off-diagonal ATTENTION block: same kr factor, q on the rows.
+            for j_s, j_k in T.Parallel(SUB, DK):
+                ql_shared[j_s, j_k] = (
+                    q_shared[SUB + j_s, j_k].astype(accum_dtype)
+                    * T.exp2(
+                        (g_shared[SUB + j_s, j_k] - g_shared[SUB, j_k]) * L2E
+                    )
+                ).astype(qkva_dtype)
+            T.gemm(
+                ql_shared, kr_shared, attnoff_fragment,
+                transpose_B=True, clear_accum=True,
+            )
+            T.copy(attnoff_fragment, attnoff_shared)
+
+        if not skip_off8:
+            # 8-token sub-blocking of the same-16-block work: the hi-half x
+            # lo-half 8x8 quadrants go to tensor cores — BOTH 16-blocks batched
+            # into one m16 gemm per gram (only the two diagonal quadrants of
+            # the [16,16] result are valid and read; the cross quadrants are
+            # finite garbage by construction). Rebase point: the block's row 8.
+            for j_s, j_k in T.Parallel(block_S, DK):
+                if j_s < SUB:
+                    klq8_shared[j_s, j_k] = (
+                        b_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
+                        * k_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
+                        * T.exp2(
+                            (
+                                g_shared[(j_s // 8) * SUB + 8 + (j_s % 8), j_k]
+                                - g_shared[(j_s // 8) * SUB + 8, j_k]
+                            )
+                            * L2E
+                        )
+                    ).astype(qkva_dtype)
+                else:
+                    klq8_shared[j_s, j_k] = (
+                        q_shared[((j_s - SUB) // 8) * SUB + 8 + (j_s % 8), j_k].astype(accum_dtype)
+                        * T.exp2(
+                            (
+                                g_shared[((j_s - SUB) // 8) * SUB + 8 + (j_s % 8), j_k]
+                                - g_shared[((j_s - SUB) // 8) * SUB + 8, j_k]
+                            )
+                            * L2E
+                        )
+                    ).astype(qkva_dtype)
+            for j_s, j_k in T.Parallel(SUB, DK):
+                kr8_shared[j_s, j_k] = (
+                    k_shared[(j_s // 8) * SUB + (j_s % 8), j_k].astype(accum_dtype)
+                    * T.exp2(
+                        (
+                            g_shared[(j_s // 8) * SUB + 8, j_k]
+                            - g_shared[(j_s // 8) * SUB + (j_s % 8), j_k]
+                        )
+                        * L2E
+                    )
+                ).astype(qkva_dtype)
+            T.gemm(
+                klq8_shared, kr8_shared, off8_fragment,
+                transpose_B=True, clear_accum=True,
+            )
+            T.copy(off8_fragment, off8_shared)
+
+        if not skip_diag8:
+            # The four 8x8 diagonals stay elementwise (no bounded factoring
+            # exists inside a block) — 47% fewer pairs than 16x16 diagonals,
+            # one exp2 feeding both grams, strip-unrolled channel loop.
+            for b8 in T.serial(4):
+                for j_s, j_t in T.Parallel(8, 8):
+                    diag_local[0] = 0.0
+                    diagq_local[0] = 0.0
+                    if j_s >= j_t:
+                        for j_ko in T.serial(8):
+                            for j_ki in T.unroll(16):
+                                e_local[0] = T.exp2(
+                                    (
+                                        g_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                                 j_ko * 16 + j_ki]
+                                        - g_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_t,
+                                                   j_ko * 16 + j_ki]
+                                    )
+                                    * L2E
+                                ) * k_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_t,
+                                             j_ko * 16 + j_ki].astype(accum_dtype)
+                                diagq_local[0] += (
+                                    q_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                             j_ko * 16 + j_ki].astype(accum_dtype)
+                                    * e_local[0]
+                                )
+                                diag_local[0] += (
+                                    b_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                             j_ko * 16 + j_ki].astype(accum_dtype)
+                                    * k_shared[(b8 // 2) * SUB + (b8 % 2) * 8 + j_s,
+                                               j_ko * 16 + j_ki].astype(accum_dtype)
+                                    * e_local[0]
+                                )
+                    if j_s > j_t:
+                        diag8a_shared[b8, j_s, j_t] = diag_local[0]
+                    else:
+                        diag8a_shared[b8, j_s, j_t] = 0.0
+                    diag8q_shared[b8, j_s, j_t] = diagq_local[0]
 
         # Assemble and store the attention matrix (inclusive tril).
         for j_s, j_t in T.Parallel(block_S, block_S):
@@ -302,57 +310,58 @@ def tilelang_kkt_solve_2(
             else:
                 a32_fragment[j_s, j_t] = arow_shared[j_s - SUB, j_t]
 
-        # ------- 16 -> 32 blocked inversion: identical to gdn sm120 -------
-        for j_s, j_t in T.Parallel(block_S, block_S):
-            if (j_s // 16) == (j_t // 16) + 1:
-                a16o_shared[j_s // 32, j_s % 16, j_t % 16] = -a32_fragment[
-                    j_s, j_t
-                ]
-            elif (j_s // 16) == (j_t // 16):
-                a16i_shared[j_s // 16, j_s % 16, j_t % 16] = a32_fragment[
-                    j_s, j_t
-                ]
+        if not skip_inv:
+            # ------- 16 -> 32 blocked inversion: identical to gdn sm120 -------
+            for j_s, j_t in T.Parallel(block_S, block_S):
+                if (j_s // 16) == (j_t // 16) + 1:
+                    a16o_shared[j_s // 32, j_s % 16, j_t % 16] = -a32_fragment[
+                        j_s, j_t
+                    ]
+                elif (j_s // 16) == (j_t // 16):
+                    a16i_shared[j_s // 16, j_s % 16, j_t % 16] = a32_fragment[
+                        j_s, j_t
+                    ]
 
-        for k_s in T.unroll(1, 16):
-            for j_s, k_t in T.Parallel(2, 16):
-                if k_t < k_s:
-                    a16i_row[j_s, k_t] = a16i_shared[j_s, k_s, k_t]
-            T.clear(a16i_sum)
-            for k_r in T.unroll(k_s):
+            for k_s in T.unroll(1, 16):
                 for j_s, k_t in T.Parallel(2, 16):
-                    a16i_sum[j_s, k_t] -= (
-                        a16i_shared[j_s, k_r, k_t] * a16i_row[j_s, k_r]
+                    if k_t < k_s:
+                        a16i_row[j_s, k_t] = a16i_shared[j_s, k_s, k_t]
+                T.clear(a16i_sum)
+                for k_r in T.unroll(k_s):
+                    for j_s, k_t in T.Parallel(2, 16):
+                        a16i_sum[j_s, k_t] -= (
+                            a16i_shared[j_s, k_r, k_t] * a16i_row[j_s, k_r]
+                        )
+                for j_s, k_t in T.Parallel(2, 16):
+                    if k_t < k_s:
+                        a16i_shared[j_s, k_s, k_t] = a16i_sum[j_s, k_t]
+
+            T.clear(a16o_fragment)
+            for k_r in T.unroll(16):
+                for j_s, k_s, k_t in T.Parallel(1, 16, 16):
+                    a16o_fragment[j_s, k_s, k_t] += (
+                        a16i_shared[j_s * 2 + 1, k_s, k_r]
+                        * a16o_shared[j_s, k_r, k_t]
                     )
-            for j_s, k_t in T.Parallel(2, 16):
-                if k_t < k_s:
-                    a16i_shared[j_s, k_s, k_t] = a16i_sum[j_s, k_t]
-
-        T.clear(a16o_fragment)
-        for k_r in T.unroll(16):
             for j_s, k_s, k_t in T.Parallel(1, 16, 16):
-                a16o_fragment[j_s, k_s, k_t] += (
-                    a16i_shared[j_s * 2 + 1, k_s, k_r]
-                    * a16o_shared[j_s, k_r, k_t]
-                )
-        for j_s, k_s, k_t in T.Parallel(1, 16, 16):
-            a16o_shared[j_s, k_t, k_s] = a16o_fragment[j_s, k_s, k_t]
-        T.clear(a16o_fragment)
-        for k_r in T.unroll(16):
-            for j_s, k_s, k_t in T.Parallel(1, 16, 16):
-                a16o_fragment[j_s, k_s, k_t] += (
-                    a16o_shared[j_s, k_r, k_s]
-                    * a16i_shared[j_s * 2, k_r, k_t]
-                )
-        T.copy(a16o_fragment, a16o_shared[:, 0:16, 0:16])
+                a16o_shared[j_s, k_t, k_s] = a16o_fragment[j_s, k_s, k_t]
+            T.clear(a16o_fragment)
+            for k_r in T.unroll(16):
+                for j_s, k_s, k_t in T.Parallel(1, 16, 16):
+                    a16o_fragment[j_s, k_s, k_t] += (
+                        a16o_shared[j_s, k_r, k_s]
+                        * a16i_shared[j_s * 2, k_r, k_t]
+                    )
+            T.copy(a16o_fragment, a16o_shared[:, 0:16, 0:16])
 
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[k_s, k_t] = a16i_shared[0, k_s, k_t]
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[k_s, 16 + k_t] = 0
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[16 + k_s, k_t] = a16o_fragment[0, k_s, k_t]
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[16 + k_s, 16 + k_t] = a16i_shared[1, k_s, k_t]
+            for k_s, k_t in T.Parallel(16, 16):
+                a32_shared[k_s, k_t] = a16i_shared[0, k_s, k_t]
+            for k_s, k_t in T.Parallel(16, 16):
+                a32_shared[k_s, 16 + k_t] = 0
+            for k_s, k_t in T.Parallel(16, 16):
+                a32_shared[16 + k_s, k_t] = a16o_fragment[0, k_s, k_t]
+            for k_s, k_t in T.Parallel(16, 16):
+                a32_shared[16 + k_s, 16 + k_t] = a16i_shared[1, k_s, k_t]
 
         # Save A (unmasked)
         if right <= seq_end_idx:
@@ -461,6 +470,7 @@ def kkt_solve(
     q: torch.Tensor,
     chunk_size: int = 32,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    **ablate,
 ):
     """A = (I + StrictLower(M))^{-1} per 32-token chunk.
 
@@ -500,6 +510,7 @@ def kkt_solve(
         g_dtype=g.dtype,
         seqlen_dtype=seqlen_dtype,
         is_varlen=is_varlen,
+        **ablate,
     )
     if is_varlen:
         kernel(k, g, b, q, cu_seqlens, chunk_indices, a, attn)

@@ -103,6 +103,15 @@ def bench_kkt_stage(args):
                         args.warmup, args.iters)
         print(f"{seq:>8} {t_gdn:14.3f}ms {t_gdn2:9.3f}ms "
               f"{t_gdn2 / t_gdn:5.2f}x")
+        if args.ablate:
+            for flag in ("skip_off16", "skip_off8", "skip_diag8",
+                         "skip_inv"):
+                t = timeit(lambda: kkt_gdn2(k, g_cs, b, qq,
+                                            chunk_size=CHUNK_SIZE_2,
+                                            **{flag: True}),
+                           args.warmup, args.iters)
+                print(f"{'':>8} -{flag[5:]:<10} {t:9.3f}ms "
+                      f"(stage ~{t_gdn2 - t:.3f}ms)")
 
 
 def main():
@@ -116,6 +125,8 @@ def main():
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--bwd", action="store_true")
+    p.add_argument("--ablate", action="store_true",
+                   help="with --stage kkt: time stage-skipping variants")
     p.add_argument("--stage", choices=["full", "kkt"], default="full",
                    help="'kkt' times the gdn2 A-build kernel alone vs gdn's")
     args = p.parse_args()
