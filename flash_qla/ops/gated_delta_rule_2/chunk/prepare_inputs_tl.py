@@ -204,3 +204,160 @@ def gcs_2(g: torch.Tensor, chunk_size: int) -> torch.Tensor:
     )
     kernel(g, g_cs, num_chunks)
     return g_cs
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_prepare_inputs_2b(
+    H,
+    Hg,
+    DK,
+    chunk_size,
+    accum_dtype,
+    qkva_dtype,
+    g_in_dtype,
+    do_l2norm,
+):
+    batch_size = T.dynamic("batch_size")
+    num_tokens = T.dynamic("num_tokens")
+    block_S = chunk_size
+
+    qk_shape = (batch_size, num_tokens, Hg, DK)
+    x_shape = (batch_size, num_tokens, H, DK)
+    gend_shape = (batch_size, T.dynamic("gend_chunks"), H, DK)
+
+    @T.prim_func
+    def tilelang_prepare_inputs_2b_kernel(
+        q: T.Tensor(qk_shape, dtype=qkva_dtype),
+        k: T.Tensor(qk_shape, dtype=qkva_dtype),
+        g: T.Tensor(x_shape, dtype=g_in_dtype),
+        b: T.Tensor(x_shape, dtype=qkva_dtype),
+        qn: T.Tensor(qk_shape, dtype=qkva_dtype),
+        kn: T.Tensor(qk_shape, dtype=qkva_dtype),
+        eq: T.Tensor(x_shape, dtype=qkva_dtype),
+        ekb: T.Tensor(x_shape, dtype=qkva_dtype),
+        kte: T.Tensor(x_shape, dtype=qkva_dtype),
+        gend: T.Tensor(gend_shape, dtype=accum_dtype),
+        num_chunks: T.int32,
+    ):
+        with T.Kernel(batch_size * num_chunks * H, threads=128) as (bch,):
+            bc, bh = bch // H, bch % H
+            bhg = bh // (H // Hg)
+            bb = bc % batch_size
+            chunk_idx = bc // batch_size
+            left = chunk_idx * block_S
+            is_lead = bh % (H // Hg) == 0
+
+            gcs_shared = T.alloc_shared((block_S, DK), dtype=accum_dtype)
+            qn_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
+            kn_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
+            acc = T.alloc_local((1), dtype=accum_dtype)
+            nrm = T.alloc_local((1), dtype=accum_dtype)
+
+            # L2-normalize q/k rows (or plain copy) into shared.
+            for rr in T.Parallel(2 * block_S):
+                nrm[0] = 0.0
+                if do_l2norm:
+                    for j_k in T.serial(DK):
+                        if left + rr % block_S < num_tokens:
+                            if rr < block_S:
+                                nrm[0] += (
+                                    q[bb, left + rr, bhg, j_k].astype(accum_dtype)
+                                    * q[bb, left + rr, bhg, j_k].astype(accum_dtype)
+                                )
+                            else:
+                                nrm[0] += (
+                                    k[bb, left + rr - block_S, bhg, j_k].astype(accum_dtype)
+                                    * k[bb, left + rr - block_S, bhg, j_k].astype(accum_dtype)
+                                )
+                    nrm[0] = T.rsqrt(nrm[0] + 1e-6)
+                else:
+                    nrm[0] = 1.0
+                for j_k in T.serial(DK):
+                    if left + rr % block_S < num_tokens:
+                        if rr < block_S:
+                            qn_shared[rr, j_k] = (
+                                q[bb, left + rr, bhg, j_k].astype(accum_dtype)
+                                * nrm[0]
+                            ).astype(qkva_dtype)
+                        else:
+                            kn_shared[rr - block_S, j_k] = (
+                                k[bb, left + rr - block_S, bhg, j_k].astype(accum_dtype)
+                                * nrm[0]
+                            ).astype(qkva_dtype)
+
+            # Per-channel inclusive cumsum of the log decay.
+            for j_k in T.Parallel(DK):
+                acc[0] = 0.0
+                for j_s in T.serial(block_S):
+                    if left + j_s < num_tokens:
+                        acc[0] += g[bb, left + j_s, bh, j_k].astype(accum_dtype)
+                    gcs_shared[j_s, j_k] = acc[0]
+
+            # Outputs. qn/kn written once per head-group (leader head).
+            for j_s, j_k in T.Parallel(block_S, DK):
+                if left + j_s < num_tokens:
+                    if is_lead:
+                        qn[bb, left + j_s, bhg, j_k] = qn_shared[j_s, j_k]
+                        kn[bb, left + j_s, bhg, j_k] = kn_shared[j_s, j_k]
+                    eq[bb, left + j_s, bh, j_k] = (
+                        T.exp2(gcs_shared[j_s, j_k] * L2E)
+                        * qn_shared[j_s, j_k].astype(accum_dtype)
+                    ).astype(qkva_dtype)
+                    ekb[bb, left + j_s, bh, j_k] = (
+                        T.exp2(gcs_shared[j_s, j_k] * L2E)
+                        * b[bb, left + j_s, bh, j_k].astype(accum_dtype)
+                        * kn_shared[j_s, j_k].astype(accum_dtype)
+                    ).astype(qkva_dtype)
+                    kte[bb, left + j_s, bh, j_k] = (
+                        T.exp2(
+                            (gcs_shared[block_S - 1, j_k] - gcs_shared[j_s, j_k])
+                            * L2E
+                        )
+                        * kn_shared[j_s, j_k].astype(accum_dtype)
+                    ).astype(qkva_dtype)
+            for j_k in T.Parallel(DK):
+                gend[bb, chunk_idx, bh, j_k] = T.exp2(
+                    gcs_shared[block_S - 1, j_k] * L2E
+                )
+
+    return tilelang_prepare_inputs_2b_kernel
+
+
+def prepare_inputs_2b(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    chunk_size: int,
+    do_l2norm: bool = False,
+):
+    """Slim prefold: (qn, kn, eq, ekb, kte, gend). No g_cs / mv tensors;
+    optional in-kernel q/k L2 normalization."""
+    q, k, g, b = (x.contiguous() for x in (q, k, g, b))
+    batch_size, num_tokens, Hg, K = k.shape
+    H = g.shape[2]
+    num_chunks = tilelang.cdiv(num_tokens, chunk_size)
+
+    qn = torch.empty_like(q)
+    kn = torch.empty_like(k)
+    eq = torch.empty(
+        (batch_size, num_tokens, H, K), dtype=q.dtype, device=q.device
+    )
+    ekb = torch.empty_like(eq)
+    kte = torch.empty_like(eq)
+    gend = torch.empty(
+        (batch_size, num_chunks, H, K), dtype=torch.float32, device=q.device
+    )
+    kernel = tilelang_prepare_inputs_2b(
+        H, Hg, K, chunk_size,
+        accum_dtype="float32",
+        qkva_dtype=q.dtype,
+        g_in_dtype=g.dtype,
+        do_l2norm=do_l2norm,
+    )
+    kernel(q, k, g, b, qn, kn, eq, ekb, kte, gend, num_chunks)
+    return qn, kn, eq, ekb, kte, gend

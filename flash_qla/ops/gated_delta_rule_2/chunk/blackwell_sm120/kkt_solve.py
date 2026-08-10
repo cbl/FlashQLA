@@ -82,21 +82,22 @@ def tilelang_kkt_solve_2(
         kl_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
         ql_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
         attnoff_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
-        attnoff_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
+        attnoff_shared = T.alloc_shared((SUB, block_S), dtype=qkva_dtype)
         attn_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
         klq8_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         kr8_shared = T.alloc_shared((SUB, DK), dtype=qkva_dtype)
         off8_fragment = T.alloc_fragment((block_S, SUB), dtype=accum_dtype)
-        off8_shared = T.alloc_shared((block_S, SUB), dtype=accum_dtype)
+        off8_shared = T.alloc_shared((block_S, SUB), dtype=qkva_dtype)
         diag8a_shared = T.alloc_shared((4, 8, 8), dtype=accum_dtype)
         diag8q_shared = T.alloc_shared((4, 8, 8), dtype=accum_dtype)
         kr_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         arow_fragment = T.alloc_fragment((SUB, block_S), dtype=accum_dtype)
-        arow_shared = T.alloc_shared((SUB, block_S), dtype=accum_dtype)
+        arow_shared = T.alloc_shared((SUB, block_S), dtype=qkva_dtype)
         a32_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
         diag_local = T.alloc_local((1), dtype=accum_dtype)
         diagq_local = T.alloc_local((1), dtype=accum_dtype)
         e_local = T.alloc_local((1), dtype=accum_dtype)
+        cum_local = T.alloc_local((1), dtype=accum_dtype)
 
         a16i_row = T.alloc_fragment((2, 16), dtype=accum_dtype)
         a16i_sum = T.alloc_fragment((2, 16), dtype=accum_dtype)
@@ -124,17 +125,22 @@ def tilelang_kkt_solve_2(
                 else:
                     k_shared[j_s, j_k] = 0
 
-        # Load b (zero-padded) and g (tail-filled with the last valid row,
-        # so pairwise differences stay bounded on padded rows)
+        # Load b/q (zero-padded) and RAW g; cumsum in-kernel (zero-pad
+        # past the end carries the last value, keeping diffs bounded).
         for j_s, j_k in T.Parallel(block_S, DK):
             if left + j_s < seq_end_idx:
                 b_shared[j_s, j_k] = b[bb, left + j_s, bh, j_k]
-                g_shared[j_s, j_k] = g[bb, left + j_s, bh, j_k]
+                g_shared[j_s, j_k] = g[bb, left + j_s, bh, j_k].astype(accum_dtype)
                 q_shared[j_s, j_k] = q[bb, left + j_s, bhg, j_k]
             else:
                 b_shared[j_s, j_k] = 0
-                g_shared[j_s, j_k] = g[bb, seq_end_idx - 1, bh, j_k]
+                g_shared[j_s, j_k] = 0.0
                 q_shared[j_s, j_k] = 0
+        for j_k in T.Parallel(DK):
+            cum_local[0] = 0.0
+            for j_s in T.serial(block_S):
+                cum_local[0] += g_shared[j_s, j_k]
+                g_shared[j_s, j_k] = cum_local[0]
         if right <= seq_end_idx:
             T.ptx_wait_group(0)
 
@@ -472,18 +478,17 @@ def kkt_solve(
     cu_seqlens: Optional[torch.LongTensor] = None,
     **ablate,
 ):
-    """A = (I + StrictLower(M))^{-1} per 32-token chunk.
+    """A and the attention gram per 32-token chunk.
 
-    k: [B, T, Hg, K] (bf16/fp16); g: [B, T, H, K] fp32 CHUNK-LOCAL
-    INCLUSIVE cumsum of the log decay; b: [B, T, H, K] (same dtype as k).
-    Returns a: [B, T, H, chunk_size] in k.dtype.
+    k: [B, T, Hg, K] (bf16/fp16); g: [B, T, H, K] RAW log decay (any
+    float dtype; the chunk-local cumsum happens in-kernel); b:
+    [B, T, H, K]. Returns (a, attn): [B, T, H, chunk_size] each.
     """
     k, g, b, q = k.contiguous(), g.contiguous(), b.contiguous(), q.contiguous()
     batch_size, num_tokens, Hg, K = k.shape
     H = b.shape[2]
     assert K == 128
     assert chunk_size == 32
-    assert g.dtype == torch.float32, "g must be the fp32 chunk-local cumsum"
     assert g.shape == b.shape == (batch_size, num_tokens, H, K)
 
     if cu_seqlens is None:

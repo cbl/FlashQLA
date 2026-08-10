@@ -44,7 +44,7 @@ def main():
 
     g_cs, eq, ekb, kte, mv, gend = prepare_inputs_2(
         q_bf, k_bf, v_bf, g32, b_bf, w_bf, chunk)
-    a, attn_k = kkt_solve(k_bf, g_cs, b_bf, q_bf, chunk_size=chunk)
+    a, attn_k = kkt_solve(k_bf, g32, b_bf, q_bf, chunk_size=chunk)
     h, ht, r = prepare_h_2(ekb, kte, mv, a, gend, initial_state=h0.float())
 
     # torch references from the SAME r/h the kernel reads

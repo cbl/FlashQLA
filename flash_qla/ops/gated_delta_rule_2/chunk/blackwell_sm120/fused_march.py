@@ -66,7 +66,8 @@ def tilelang_fused_march_2(
         ekb: T.Tensor(x_shape, dtype=qkva_dtype),
         kte: T.Tensor(x_shape, dtype=qkva_dtype),
         eq: T.Tensor(x_shape, dtype=qkva_dtype),
-        mv: T.Tensor(v_shape, dtype=qkva_dtype),
+        v: T.Tensor(v_shape, dtype=qkva_dtype),
+        w: T.Tensor(v_shape, dtype=qkva_dtype),
         gend: T.Tensor(gend_shape, dtype=gend_dtype),
         a: T.Tensor(a_shape, dtype=qkva_dtype),
         attn: T.Tensor(a_shape, dtype=qkva_dtype),
@@ -195,7 +196,10 @@ def tilelang_fused_march_2(
                             eq_shared[st, j_s, j_k] = 0
                     for j_s, j_v in T.Parallel(block_S, DVS):
                         if left + j_s < num_tokens:
-                            mv_shared[st, j_s, j_v] = mv[bb, left + j_s, bh, vo + j_v]
+                            mv_shared[st, j_s, j_v] = (
+                                w[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
+                                * v[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
+                            ).astype(qkva_dtype)
                         else:
                             mv_shared[st, j_s, j_v] = 0
                     for j_s, j_t in T.Parallel(block_S, block_S):
@@ -215,7 +219,8 @@ def fused_march_2(
     ekb: torch.Tensor,
     kte: torch.Tensor,
     eq: torch.Tensor,
-    mv: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
     gend: torch.Tensor,
     a: torch.Tensor,
     attn: torch.Tensor,
@@ -224,15 +229,16 @@ def fused_march_2(
     output_final_state: bool = True,
 ):
     """March + output in one pass on PRE-FOLDED operands (from
-    prepare_inputs_2). ekb/kte/eq: [B, T, H, K]; mv: [B, T, H, V]; gend:
+    prepare_inputs_2b). ekb/kte/eq: [B, T, H, K]; v/w: [B, T, H, V]
+    (w*v folds in the producer); gend:
     [B, N, H, K] fp32 (e^{G_end}); a/attn: [B, T, H, chunk] from
     kkt_solve. Returns (o [B, T, H, V], ht)."""
-    ekb, kte, eq, mv, a, attn = (
-        x.contiguous() for x in (ekb, kte, eq, mv, a, attn)
+    ekb, kte, eq, v, w, a, attn = (
+        x.contiguous() for x in (ekb, kte, eq, v, w, a, attn)
     )
     gend = gend.contiguous()
     batch_size, num_tokens, H, K = ekb.shape
-    V = mv.shape[3]
+    V = v.shape[3]
     chunk_size = a.shape[-1]
     assert K == 128 and V == 128
     assert gend.dtype == torch.float32
@@ -269,5 +275,5 @@ def fused_march_2(
         v_split=int(os.environ.get("FLASHQLA_MARCH_VSPLIT", "4")),
     )
     num_chunks = tilelang.cdiv(num_tokens, chunk_size)
-    kernel(ekb, kte, eq, mv, gend, a, attn, initial_state, o, ht, num_chunks)
+    kernel(ekb, kte, eq, v, w, gend, a, attn, initial_state, o, ht, num_chunks)
     return o, (ht if output_final_state else None)

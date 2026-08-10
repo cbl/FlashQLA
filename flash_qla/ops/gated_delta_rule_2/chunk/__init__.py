@@ -89,13 +89,14 @@ if _ARCH == "9.0":
     fused_fwd_2 = None
     fused_march_2 = None
     gcs_2 = None
+    prepare_inputs_2b = None
     CHUNK_SIZE_2 = 64
 elif _ARCH == "12.0":
     from .blackwell_sm120 import kkt_solve
     from .blackwell_sm120.prepare_h import prepare_h_2
     from .blackwell_sm120.fused_fwd import fused_fwd_2
     from .blackwell_sm120.fused_march import fused_march_2
-    from .prepare_inputs_tl import gcs_2
+    from .prepare_inputs_tl import gcs_2, prepare_inputs_2b
     CHUNK_SIZE_2 = 32
 else:
     # Unsupported archs see the informative raise in chunk_gdn2 below
@@ -105,6 +106,7 @@ else:
     fused_fwd_2 = None
     fused_march_2 = None
     gcs_2 = None
+    prepare_inputs_2b = None
     CHUNK_SIZE_2 = None
 
 
@@ -175,18 +177,14 @@ def chunk_gdn2(
     # graph — do not train through this yet.
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    if use_qk_l2norm_in_kernel:
-        from flash_qla.utils import l2norm_fwd
-
-        q, _ = l2norm_fwd(q)
-        k, _ = l2norm_fwd(k)
-
     b = b.to(k.dtype)
     w = w.to(v.dtype)
-    g_cs, eq, ekb, kte, mv, gend = _prepare_inputs(q, k, v, g, b, w, CHUNK_SIZE_2)
-    a, attn = kkt_solve(k, g_cs, b, q, chunk_size=CHUNK_SIZE_2)
+    qn, kn, eq, ekb, kte, gend = prepare_inputs_2b(
+        q, k, g, b, CHUNK_SIZE_2, do_l2norm=use_qk_l2norm_in_kernel,
+    )
+    a, attn = kkt_solve(kn, g, b, qn, chunk_size=CHUNK_SIZE_2)
     o, ht = fused_march_2(
-        ekb, kte, eq, mv, gend, a, attn, scale,
+        ekb, kte, eq, v, w, gend, a, attn, scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
     )

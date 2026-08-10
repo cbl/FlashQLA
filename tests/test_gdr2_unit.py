@@ -171,9 +171,8 @@ def test_kkt_solve_2_matches_ref(B, T, Hk, Hv):
     chunk = CHUNK_SIZE_2
     k_bf = k.to(torch.bfloat16)
     b_bf = b.to(torch.bfloat16)
-    g_cs = _chunk_cumsum(g.float(), chunk)                     # fp32, kernel input
-
-    a_kernel, attn_kernel = kkt_solve(k_bf, g_cs, b_bf, q.to(torch.bfloat16),
+    a_kernel, attn_kernel = kkt_solve(k_bf, g.float(), b_bf,
+                                      q.to(torch.bfloat16),
                                       chunk_size=chunk)
 
     # fp64 reference from the SAME quantized inputs.

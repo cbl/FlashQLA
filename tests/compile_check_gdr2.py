@@ -54,6 +54,10 @@ BASE = "flash_qla/ops/gated_delta_rule_2/chunk/"
 BF16, F32 = torch.bfloat16, torch.float32
 
 CASES = [
+    ("prefold_2b", BASE + "prepare_inputs_tl.py",
+     "tilelang_prepare_inputs_2b",
+     dict(H=4, Hg=2, DK=128, chunk_size=32, accum_dtype="float32",
+          qkva_dtype=BF16, g_in_dtype=F32, do_l2norm=True)),
     ("gcs", BASE + "prepare_inputs_tl.py",
      "tilelang_gcs_2",
      dict(H=4, DK=128, chunk_size=32, accum_dtype="float32",
