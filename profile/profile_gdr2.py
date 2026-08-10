@@ -70,6 +70,18 @@ def main():
     print("-- compact (self GPU time; 'other' = torch precompute/copies) --")
     for name, t in buckets.items():
         print(f"{name:6} {t / 1e3:8.2f}ms {100 * t / total:5.1f}%")
+    print("-- top kernels (>2%) --")
+    rows = sorted(
+        ((getattr(ev, "self_device_time_total",
+                  getattr(ev, "self_cuda_time_total", 0.0)), ev.key)
+         for ev in events),
+        reverse=True,
+    )
+    for t, name in rows:
+        if t < 0.02 * total:
+            break
+        short = name.replace("tilelang_", "").replace("_kernel", "")
+        print(f"  {short[:44]:44} {t / 1e3:7.2f}ms {100 * t / total:5.1f}%")
     if args.table:
         print(prof.key_averages().table(
             sort_by="self_cuda_time_total", row_limit=25))
