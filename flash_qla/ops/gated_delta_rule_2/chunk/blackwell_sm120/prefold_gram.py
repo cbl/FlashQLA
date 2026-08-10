@@ -390,10 +390,15 @@ def tilelang_prefold_gram_2(
 
         # Assemble and store the attention matrix (inclusive tril).
             for j_s, j_t in T.Parallel(block_S, block_S):
-                if (j_s // 8) == (j_t // 8):
-                    attn_fragment[j_s, j_t] = diag8q_shared[
-                        j_s // 8, j_s % 8, j_t % 8
+                if (j_s // 4) == (j_t // 4):
+                    attn_fragment[j_s, j_t] = diag4q_shared[
+                        j_s // 4, j_s % 4, j_t % 4
                     ]
+                elif ((j_s // 8) == (j_t // 8)) and ((j_s // 4) > (j_t // 4)):
+                    attn_fragment[j_s, j_t] = (
+                        off4q_shared[(j_s // 8) * 4 + (j_s % 4),
+                                     (j_t // 8) * 4 + (j_t % 4)]
+                    ).astype(accum_dtype)
                 elif ((j_s // SUB) == (j_t // SUB)) and ((j_s // 8) > (j_t // 8)):
                     attn_fragment[j_s, j_t] = off8_shared[
                         SUB + (j_s // SUB) * 8 + (j_s % SUB) - 8,
@@ -418,10 +423,15 @@ def tilelang_prefold_gram_2(
                     a32_fragment[j_s, j_t] = 0
                 elif j_s == j_t:
                     a32_fragment[j_s, j_t] = 1
-                elif (j_s // 8) == (j_t // 8):
-                    a32_fragment[j_s, j_t] = diag8a_shared[
-                        j_s // 8, j_s % 8, j_t % 8
+                elif (j_s // 4) == (j_t // 4):
+                    a32_fragment[j_s, j_t] = diag4a_shared[
+                        j_s // 4, j_s % 4, j_t % 4
                     ]
+                elif (j_s // 8) == (j_t // 8):
+                    a32_fragment[j_s, j_t] = (
+                        off4a_shared[(j_s // 8) * 4 + (j_s % 4),
+                                     (j_t // 8) * 4 + (j_t % 4)]
+                    ).astype(accum_dtype)
                 elif (j_s // SUB) == (j_t // SUB):
                     a32_fragment[j_s, j_t] = off8_shared[
                         (j_s // SUB) * 8 + (j_s % SUB) - 8,
