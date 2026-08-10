@@ -345,46 +345,46 @@ def tilelang_prefold_gram_2(
 
             if not skip_diag8:
                 # The eight 4x4 diagonals stay elementwise (80 inclusive
-            # pairs, exactly one per thread), one exp2 feeding both grams.
-            for b4, j_s, j_t in T.Parallel(8, 4, 4):
-                diag_local[0] = 0.0
-                diagq_local[0] = 0.0
-                if j_s >= j_t:
-                    for j_ko in T.serial(8):
-                        for j_ki in T.unroll(16):
-                            e_local[0] = T.exp2(
-                                (
-                                    g_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
+                # pairs, exactly one per thread), one exp2 feeding both grams.
+                for b4, j_s, j_t in T.Parallel(8, 4, 4):
+                    diag_local[0] = 0.0
+                    diagq_local[0] = 0.0
+                    if j_s >= j_t:
+                        for j_ko in T.serial(8):
+                            for j_ki in T.unroll(16):
+                                e_local[0] = T.exp2(
+                                    (
+                                        g_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
+                                                 + (b4 % 2) * 4 + j_s,
+                                                 j_ko * 16 + j_ki]
+                                        - g_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
+                                                   + (b4 % 2) * 4 + j_t,
+                                                   j_ko * 16 + j_ki]
+                                    )
+                                    * L2E
+                                ) * k_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
+                                             + (b4 % 2) * 4 + j_t,
+                                             j_ko * 16 + j_ki].astype(accum_dtype)
+                                diagq_local[0] += (
+                                    q_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
                                              + (b4 % 2) * 4 + j_s,
-                                             j_ko * 16 + j_ki]
-                                    - g_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
-                                               + (b4 % 2) * 4 + j_t,
-                                               j_ko * 16 + j_ki]
+                                             j_ko * 16 + j_ki].astype(accum_dtype)
+                                    * e_local[0]
                                 )
-                                * L2E
-                            ) * k_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
-                                         + (b4 % 2) * 4 + j_t,
-                                         j_ko * 16 + j_ki].astype(accum_dtype)
-                            diagq_local[0] += (
-                                q_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
-                                         + (b4 % 2) * 4 + j_s,
-                                         j_ko * 16 + j_ki].astype(accum_dtype)
-                                * e_local[0]
-                            )
-                            diag_local[0] += (
-                                b_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
-                                         + (b4 % 2) * 4 + j_s,
-                                         j_ko * 16 + j_ki].astype(accum_dtype)
-                                * k_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
-                                           + (b4 % 2) * 4 + j_s,
-                                           j_ko * 16 + j_ki].astype(accum_dtype)
-                                * e_local[0]
-                            )
-                if j_s > j_t:
-                    diag4a_shared[b4, j_s, j_t] = diag_local[0]
-                else:
-                    diag4a_shared[b4, j_s, j_t] = 0.0
-                diag4q_shared[b4, j_s, j_t] = diagq_local[0]
+                                diag_local[0] += (
+                                    b_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
+                                             + (b4 % 2) * 4 + j_s,
+                                             j_ko * 16 + j_ki].astype(accum_dtype)
+                                    * k_shared[(b4 // 4) * 16 + ((b4 % 4) // 2) * 8
+                                               + (b4 % 2) * 4 + j_s,
+                                               j_ko * 16 + j_ki].astype(accum_dtype)
+                                    * e_local[0]
+                                )
+                    if j_s > j_t:
+                        diag4a_shared[b4, j_s, j_t] = diag_local[0]
+                    else:
+                        diag4a_shared[b4, j_s, j_t] = 0.0
+                    diag4q_shared[b4, j_s, j_t] = diagq_local[0]
 
         # Assemble and store the attention matrix (inclusive tril).
             for j_s, j_t in T.Parallel(block_S, block_S):
