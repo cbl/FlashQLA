@@ -12,8 +12,10 @@ FLY from raw tensors (ekb/kte/eq/mv never exist in global memory):
     S  = e^{G_end} * S + kte^T @ R
 
 Grid: (batch, head, V-slice) — the march is independent per value-column
-slice. Flat 128-thread blocks (v0); producer/consumer pipelining is the
-next evolution once numerics are pinned.
+slice. Warp-specialized (v1.5): 128 consumer threads own the resident
+state and the five GEMMs; 128 producer threads fold the NEXT chunk's
+operands from raw tensors into double-buffered stages, so folding cost
+hides under compute. Barrier pattern mirrors the gdn prepare_h kernel.
 """
 
 from typing import Optional
@@ -74,22 +76,23 @@ def tilelang_fused_march_2(
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
         num_chunks: T.int32,
     ):
-        with T.Kernel(batch_size * H * v_split, threads=128) as (bbhv,):
+        with T.Kernel(batch_size * H * v_split, threads=256) as (bbhv,):
             bb = bbhv // (H * v_split)
             bh = (bbhv % (H * v_split)) // v_split
             vo = (bbhv % v_split) * DVS
             bhg = bh // (H // Hg)
+            NS = 2
 
-            ekb_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
-            kte_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
-            eq_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
-            mv_shared = T.alloc_shared((block_S, DVS), dtype=qkva_dtype)
-            a_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
-            attn_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
+            ekb_shared = T.alloc_shared((NS, block_S, DK), dtype=qkva_dtype)
+            kte_shared = T.alloc_shared((NS, block_S, DK), dtype=qkva_dtype)
+            eq_shared = T.alloc_shared((NS, block_S, DK), dtype=qkva_dtype)
+            mv_shared = T.alloc_shared((NS, block_S, DVS), dtype=qkva_dtype)
+            a_shared = T.alloc_shared((NS, block_S, block_S), dtype=qkva_dtype)
+            attn_shared = T.alloc_shared((NS, block_S, block_S), dtype=qkva_dtype)
+            glast_shared = T.alloc_shared((NS, DK), dtype=accum_dtype, scope="shared")
             s_shared = T.alloc_shared((DK, DVS), dtype=qkva_dtype)
             ymu_shared = T.alloc_shared((block_S, DVS), dtype=qkva_dtype)
             r_shared = T.alloc_shared((block_S, DVS), dtype=qkva_dtype)
-            glast_shared = T.alloc_shared((DK), dtype=accum_dtype, scope="shared")
 
             s_fragment = T.alloc_fragment((DK, DVS), dtype=accum_dtype)
             u_fragment = T.alloc_fragment((block_S, DVS), dtype=accum_dtype)
@@ -98,92 +101,141 @@ def tilelang_fused_march_2(
 
             last_idx = T.alloc_var("int32")
 
-            if use_initial_state:
-                T.copy(h0[bb, bh, 0:DK, vo:vo + DVS], s_fragment)
-            else:
-                T.clear(s_fragment)
+            data_is_ready = T.alloc_barrier(arrive_count=[128] * NS)
+            data_is_free = T.alloc_barrier(arrive_count=[128] * NS)
+            bar_s = T.alloc_barrier(arrive_count=128)
+            bar_ymu = T.alloc_barrier(arrive_count=128)
+            bar_r = T.alloc_barrier(arrive_count=128)
 
-            for i_s in T.serial(num_chunks):
-                left = i_s * block_S
-                last_idx = left + block_S - 1
-                if last_idx >= num_tokens:
-                    last_idx = num_tokens - 1
+            tx = T.get_thread_binding()
 
-                # G_end (log) for this chunk, per channel.
-                for j_k in T.Parallel(DK):
-                    glast_shared[j_k] = g[bb, last_idx, bh, j_k]
+            if tx < 128:
+                # Consumer: resident state + the five GEMMs per chunk.
+                if use_initial_state:
+                    T.copy(h0[bb, bh, 0:DK, vo:vo + DVS], s_fragment)
+                else:
+                    T.clear(s_fragment)
 
-                # Fold operands on the fly from raw tensors (one pass).
-                for j_s, j_k in T.Parallel(block_S, DK):
-                    if left + j_s < num_tokens:
-                        ekb_shared[j_s, j_k] = (
-                            T.exp2(g[bb, left + j_s, bh, j_k] * L2E)
-                            * b[bb, left + j_s, bh, j_k].astype(accum_dtype)
-                            * k[bb, left + j_s, bhg, j_k].astype(accum_dtype)
-                        ).astype(qkva_dtype)
-                        kte_shared[j_s, j_k] = (
-                            T.exp2(
-                                (glast_shared[j_k] - g[bb, left + j_s, bh, j_k])
-                                * L2E
-                            )
-                            * k[bb, left + j_s, bhg, j_k].astype(accum_dtype)
-                        ).astype(qkva_dtype)
-                        eq_shared[j_s, j_k] = (
-                            T.exp2(g[bb, left + j_s, bh, j_k] * L2E)
-                            * q[bb, left + j_s, bhg, j_k].astype(accum_dtype)
-                        ).astype(qkva_dtype)
-                    else:
-                        ekb_shared[j_s, j_k] = 0
-                        kte_shared[j_s, j_k] = 0
-                        eq_shared[j_s, j_k] = 0
-                for j_s, j_v in T.Parallel(block_S, DVS):
-                    if left + j_s < num_tokens:
-                        mv_shared[j_s, j_v] = (
-                            w[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
-                            * v[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
-                        ).astype(qkva_dtype)
-                    else:
-                        mv_shared[j_s, j_v] = 0
-                for j_s, j_t in T.Parallel(block_S, block_S):
-                    if left + j_s < num_tokens:
-                        a_shared[j_s, j_t] = a[bb, left + j_s, bh, j_t]
-                        attn_shared[j_s, j_t] = attn[bb, left + j_s, bh, j_t]
-                    else:
-                        a_shared[j_s, j_t] = 0
-                        attn_shared[j_s, j_t] = 0
+                for i_s in T.serial(num_chunks):
+                    st = i_s % NS
+                    T.barrier_wait(data_is_ready[st], (i_s // NS + 0) % 2)
 
-                # U = ekb @ S ; R = A @ (mv - U)
-                T.copy(s_fragment, s_shared)
-                T.gemm(ekb_shared, s_shared, u_fragment, clear_accum=True)
-                for j_s, j_v in T.Parallel(block_S, DVS):
-                    u_fragment[j_s, j_v] = (
-                        mv_shared[j_s, j_v].astype(accum_dtype)
-                        - u_fragment[j_s, j_v]
+                    left = i_s * block_S
+                    T.copy(s_fragment, s_shared)
+                    T.barrier_arrive(bar_s)
+                    T.barrier_wait(bar_s, i_s % 2)
+
+                    # U = ekb @ S ; ymu = mv - U
+                    T.gemm(
+                        ekb_shared[st, :, :], s_shared, u_fragment,
+                        clear_accum=True,
                     )
-                T.copy(u_fragment, ymu_shared)
-                T.gemm(a_shared, ymu_shared, r_fragment, clear_accum=True)
-                T.copy(r_fragment, r_shared)
+                    for j_s, j_v in T.Parallel(block_S, DVS):
+                        u_fragment[j_s, j_v] = (
+                            mv_shared[st, j_s, j_v].astype(accum_dtype)
+                            - u_fragment[j_s, j_v]
+                        )
+                    T.copy(u_fragment, ymu_shared)
+                    T.barrier_arrive(bar_ymu)
+                    T.barrier_wait(bar_ymu, i_s % 2)
 
-                # o = scale * (attn @ R + eq @ S)
-                T.clear(o_fragment)
-                T.gemm(attn_shared, r_shared, o_fragment, clear_accum=False)
-                T.gemm(eq_shared, s_shared, o_fragment, clear_accum=False)
-                for j_s, j_v in T.Parallel(block_S, DVS):
-                    if left + j_s < num_tokens:
-                        o[bb, left + j_s, bh, vo + j_v] = (
-                            o_fragment[j_s, j_v] * scale
-                        ).astype(o_dtype)
+                    # R = A @ ymu
+                    T.gemm(
+                        a_shared[st, :, :], ymu_shared, r_fragment,
+                        clear_accum=True,
+                    )
+                    T.copy(r_fragment, r_shared)
+                    T.barrier_arrive(bar_r)
+                    T.barrier_wait(bar_r, i_s % 2)
 
-                # S = e^{G_end} * S + kte^T @ R
-                for j_k, j_v in T.Parallel(DK, DVS):
-                    s_fragment[j_k, j_v] *= T.exp2(glast_shared[j_k] * L2E)
-                T.gemm(
-                    kte_shared, r_shared, s_fragment,
-                    transpose_A=True, clear_accum=False,
-                )
+                    # o = scale * (attn @ R + eq @ S)
+                    T.clear(o_fragment)
+                    T.gemm(
+                        attn_shared[st, :, :], r_shared, o_fragment,
+                        clear_accum=False,
+                    )
+                    T.gemm(
+                        eq_shared[st, :, :], s_shared, o_fragment,
+                        clear_accum=False,
+                    )
+                    for j_s, j_v in T.Parallel(block_S, DVS):
+                        if left + j_s < num_tokens:
+                            o[bb, left + j_s, bh, vo + j_v] = (
+                                o_fragment[j_s, j_v] * scale
+                            ).astype(o_dtype)
 
-            if store_final_state:
-                T.copy(s_fragment, ht[bb, bh, 0:DK, vo:vo + DVS])
+                    # S = e^{G_end} * S + kte^T @ R
+                    for j_k, j_v in T.Parallel(DK, DVS):
+                        s_fragment[j_k, j_v] *= T.exp2(
+                            glast_shared[st, j_k] * L2E
+                        )
+                    T.gemm(
+                        kte_shared[st, :, :], r_shared, s_fragment,
+                        transpose_A=True, clear_accum=False,
+                    )
+
+                    T.barrier_arrive(data_is_free[st])
+
+                if store_final_state:
+                    T.copy(s_fragment, ht[bb, bh, 0:DK, vo:vo + DVS])
+
+            else:
+                # Producer: fold the next chunk's operands into the stage.
+                for i_s in T.serial(num_chunks):
+                    st = i_s % NS
+                    T.barrier_wait(data_is_free[st], (i_s // NS + 1) % 2)
+
+                    left = i_s * block_S
+                    last_idx = left + block_S - 1
+                    if last_idx >= num_tokens:
+                        last_idx = num_tokens - 1
+
+                    for j_k in T.Parallel(DK):
+                        glast_shared[st, j_k] = g[bb, last_idx, bh, j_k]
+                    for j_s, j_k in T.Parallel(block_S, DK):
+                        if left + j_s < num_tokens:
+                            ekb_shared[st, j_s, j_k] = (
+                                T.exp2(g[bb, left + j_s, bh, j_k] * L2E)
+                                * b[bb, left + j_s, bh, j_k].astype(accum_dtype)
+                                * k[bb, left + j_s, bhg, j_k].astype(accum_dtype)
+                            ).astype(qkva_dtype)
+                            # G_end read from global (L2-served) to avoid a
+                            # producer-internal sync on glast_shared.
+                            kte_shared[st, j_s, j_k] = (
+                                T.exp2(
+                                    (
+                                        g[bb, last_idx, bh, j_k]
+                                        - g[bb, left + j_s, bh, j_k]
+                                    )
+                                    * L2E
+                                )
+                                * k[bb, left + j_s, bhg, j_k].astype(accum_dtype)
+                            ).astype(qkva_dtype)
+                            eq_shared[st, j_s, j_k] = (
+                                T.exp2(g[bb, left + j_s, bh, j_k] * L2E)
+                                * q[bb, left + j_s, bhg, j_k].astype(accum_dtype)
+                            ).astype(qkva_dtype)
+                        else:
+                            ekb_shared[st, j_s, j_k] = 0
+                            kte_shared[st, j_s, j_k] = 0
+                            eq_shared[st, j_s, j_k] = 0
+                    for j_s, j_v in T.Parallel(block_S, DVS):
+                        if left + j_s < num_tokens:
+                            mv_shared[st, j_s, j_v] = (
+                                w[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
+                                * v[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
+                            ).astype(qkva_dtype)
+                        else:
+                            mv_shared[st, j_s, j_v] = 0
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        if left + j_s < num_tokens:
+                            a_shared[st, j_s, j_t] = a[bb, left + j_s, bh, j_t]
+                            attn_shared[st, j_s, j_t] = attn[bb, left + j_s, bh, j_t]
+                        else:
+                            a_shared[st, j_s, j_t] = 0
+                            attn_shared[st, j_s, j_t] = 0
+
+                    T.barrier_arrive(data_is_ready[st])
 
     return tilelang_fused_march_2_kernel
 
