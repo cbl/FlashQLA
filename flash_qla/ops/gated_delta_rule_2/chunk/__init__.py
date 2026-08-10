@@ -90,12 +90,14 @@ if _ARCH == "9.0":
     fused_march_2 = None
     gcs_2 = None
     prepare_inputs_2b = None
+    prefold_gram_2 = None
     CHUNK_SIZE_2 = 64
 elif _ARCH == "12.0":
     from .blackwell_sm120 import kkt_solve
     from .blackwell_sm120.prepare_h import prepare_h_2
     from .blackwell_sm120.fused_fwd import fused_fwd_2
     from .blackwell_sm120.fused_march import fused_march_2
+    from .blackwell_sm120.prefold_gram import prefold_gram_2
     from .prepare_inputs_tl import gcs_2, prepare_inputs_2b
     CHUNK_SIZE_2 = 32
 else:
@@ -107,6 +109,7 @@ else:
     fused_march_2 = None
     gcs_2 = None
     prepare_inputs_2b = None
+    prefold_gram_2 = None
     CHUNK_SIZE_2 = None
 
 
@@ -179,10 +182,10 @@ def chunk_gdn2(
         scale = k.shape[-1] ** -0.5
     b = b.to(k.dtype)
     w = w.to(v.dtype)
-    qn, kn, eq, ekb, kte, gend = prepare_inputs_2b(
-        q, k, g, b, CHUNK_SIZE_2, do_l2norm=use_qk_l2norm_in_kernel,
+    eq, ekb, kte, gend, a, attn = prefold_gram_2(
+        q, k, g, b, chunk_size=CHUNK_SIZE_2,
+        do_l2norm=use_qk_l2norm_in_kernel,
     )
-    a, attn = kkt_solve(kn, g, b, qn, chunk_size=CHUNK_SIZE_2)
     o, ht = fused_march_2(
         ekb, kte, eq, v, w, gend, a, attn, scale,
         initial_state=initial_state,
