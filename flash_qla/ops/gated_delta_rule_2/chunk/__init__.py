@@ -183,10 +183,10 @@ def chunk_gdn2(
 
     b = b.to(k.dtype)
     w = w.to(v.dtype)
-    g_cs = gcs_2(g, CHUNK_SIZE_2)
+    g_cs, eq, ekb, kte, mv, gend = _prepare_inputs(q, k, v, g, b, w, CHUNK_SIZE_2)
     a, attn = kkt_solve(k, g_cs, b, q, chunk_size=CHUNK_SIZE_2)
     o, ht = fused_march_2(
-        q, k, v, g_cs, b, w, a, attn, scale,
+        ekb, kte, eq, mv, gend, a, attn, scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
     )

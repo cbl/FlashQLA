@@ -41,7 +41,7 @@ def tilelang_fused_march_2(
     scale,
     accum_dtype,
     qkva_dtype,
-    g_dtype,
+    gend_dtype,
     ht_dtype,
     o_dtype,
     use_initial_state,
@@ -53,22 +53,20 @@ def tilelang_fused_march_2(
     block_S = chunk_size
     DVS = DV // v_split
 
-    qk_shape = (batch_size, num_tokens, Hg, DK)
-    g_shape = (batch_size, num_tokens, H, DK)
-    bx_shape = (batch_size, num_tokens, H, DK)
+    x_shape = (batch_size, num_tokens, H, DK)
     v_shape = (batch_size, num_tokens, H, DV)
     a_shape = (batch_size, num_tokens, H, chunk_size)
+    gend_shape = (batch_size, T.dynamic("gend_chunks"), H, DK)
     h0_shape = (batch_size, H, DK, DV)
     ht_shape = (batch_size, H, DK, DV)
 
     @T.prim_func
     def tilelang_fused_march_2_kernel(
-        q: T.Tensor(qk_shape, dtype=qkva_dtype),
-        k: T.Tensor(qk_shape, dtype=qkva_dtype),
-        v: T.Tensor(v_shape, dtype=qkva_dtype),
-        g: T.Tensor(g_shape, dtype=g_dtype),
-        b: T.Tensor(bx_shape, dtype=qkva_dtype),
-        w: T.Tensor(v_shape, dtype=qkva_dtype),
+        ekb: T.Tensor(x_shape, dtype=qkva_dtype),
+        kte: T.Tensor(x_shape, dtype=qkva_dtype),
+        eq: T.Tensor(x_shape, dtype=qkva_dtype),
+        mv: T.Tensor(v_shape, dtype=qkva_dtype),
+        gend: T.Tensor(gend_shape, dtype=gend_dtype),
         a: T.Tensor(a_shape, dtype=qkva_dtype),
         attn: T.Tensor(a_shape, dtype=qkva_dtype),
         h0: T.Tensor(h0_shape, dtype=ht_dtype),
@@ -80,7 +78,6 @@ def tilelang_fused_march_2(
             bb = bbhv // (H * v_split)
             bh = (bbhv % (H * v_split)) // v_split
             vo = (bbhv % v_split) * DVS
-            bhg = bh // (H // Hg)
             NS = 2
 
             ekb_shared = T.alloc_shared((NS, block_S, DK), dtype=qkva_dtype)
@@ -98,8 +95,6 @@ def tilelang_fused_march_2(
             u_fragment = T.alloc_fragment((block_S, DVS), dtype=accum_dtype)
             r_fragment = T.alloc_fragment((block_S, DVS), dtype=accum_dtype)
             o_fragment = T.alloc_fragment((block_S, DVS), dtype=accum_dtype)
-
-            last_idx = T.alloc_var("int32")
 
             data_is_ready = T.alloc_barrier(arrive_count=[128] * NS)
             data_is_free = T.alloc_barrier(arrive_count=[128] * NS)
@@ -166,9 +161,7 @@ def tilelang_fused_march_2(
 
                     # S = e^{G_end} * S + kte^T @ R
                     for j_k, j_v in T.Parallel(DK, DVS):
-                        s_fragment[j_k, j_v] *= T.exp2(
-                            glast_shared[st, j_k] * L2E
-                        )
+                        s_fragment[j_k, j_v] *= glast_shared[st, j_k]
                     T.gemm(
                         kte_shared[st, :, :], r_shared, s_fragment,
                         transpose_A=True, clear_accum=False,
@@ -180,51 +173,28 @@ def tilelang_fused_march_2(
                     T.copy(s_fragment, ht[bb, bh, 0:DK, vo:vo + DVS])
 
             else:
-                # Producer: fold the next chunk's operands into the stage.
+                # Producer: copy the next chunk's PRE-FOLDED operands
+                # into the stage (folding runs fully parallel upstream;
+                # serializing it into this march was measured 3x worse).
                 for i_s in T.serial(num_chunks):
                     st = i_s % NS
                     T.barrier_wait(data_is_free[st], (i_s // NS + 1) % 2)
 
                     left = i_s * block_S
-                    last_idx = left + block_S - 1
-                    if last_idx >= num_tokens:
-                        last_idx = num_tokens - 1
-
                     for j_k in T.Parallel(DK):
-                        glast_shared[st, j_k] = g[bb, last_idx, bh, j_k]
+                        glast_shared[st, j_k] = gend[bb, i_s, bh, j_k]
                     for j_s, j_k in T.Parallel(block_S, DK):
                         if left + j_s < num_tokens:
-                            ekb_shared[st, j_s, j_k] = (
-                                T.exp2(g[bb, left + j_s, bh, j_k] * L2E)
-                                * b[bb, left + j_s, bh, j_k].astype(accum_dtype)
-                                * k[bb, left + j_s, bhg, j_k].astype(accum_dtype)
-                            ).astype(qkva_dtype)
-                            # G_end read from global (L2-served) to avoid a
-                            # producer-internal sync on glast_shared.
-                            kte_shared[st, j_s, j_k] = (
-                                T.exp2(
-                                    (
-                                        g[bb, last_idx, bh, j_k]
-                                        - g[bb, left + j_s, bh, j_k]
-                                    )
-                                    * L2E
-                                )
-                                * k[bb, left + j_s, bhg, j_k].astype(accum_dtype)
-                            ).astype(qkva_dtype)
-                            eq_shared[st, j_s, j_k] = (
-                                T.exp2(g[bb, left + j_s, bh, j_k] * L2E)
-                                * q[bb, left + j_s, bhg, j_k].astype(accum_dtype)
-                            ).astype(qkva_dtype)
+                            ekb_shared[st, j_s, j_k] = ekb[bb, left + j_s, bh, j_k]
+                            kte_shared[st, j_s, j_k] = kte[bb, left + j_s, bh, j_k]
+                            eq_shared[st, j_s, j_k] = eq[bb, left + j_s, bh, j_k]
                         else:
                             ekb_shared[st, j_s, j_k] = 0
                             kte_shared[st, j_s, j_k] = 0
                             eq_shared[st, j_s, j_k] = 0
                     for j_s, j_v in T.Parallel(block_S, DVS):
                         if left + j_s < num_tokens:
-                            mv_shared[st, j_s, j_v] = (
-                                w[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
-                                * v[bb, left + j_s, bh, vo + j_v].astype(accum_dtype)
-                            ).astype(qkva_dtype)
+                            mv_shared[st, j_s, j_v] = mv[bb, left + j_s, bh, vo + j_v]
                         else:
                             mv_shared[st, j_s, j_v] = 0
                     for j_s, j_t in T.Parallel(block_S, block_S):
@@ -241,56 +211,56 @@ def tilelang_fused_march_2(
 
 
 def fused_march_2(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_cs: torch.Tensor,
-    b: torch.Tensor,
-    w: torch.Tensor,
+    ekb: torch.Tensor,
+    kte: torch.Tensor,
+    eq: torch.Tensor,
+    mv: torch.Tensor,
+    gend: torch.Tensor,
     a: torch.Tensor,
     attn: torch.Tensor,
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
 ):
-    """March + output in one pass. q/k: [B, T, Hg, K]; g_cs: [B, T, H, K]
-    fp32 chunk-local cumsum; b: [B, T, H, K]; v/w: [B, T, H, V]; a/attn:
-    [B, T, H, chunk] from kkt_solve. Returns (o [B, T, H, V], ht)."""
-    q, k, v, b, w, a, attn = (
-        x.contiguous() for x in (q, k, v, b, w, a, attn)
+    """March + output in one pass on PRE-FOLDED operands (from
+    prepare_inputs_2). ekb/kte/eq: [B, T, H, K]; mv: [B, T, H, V]; gend:
+    [B, N, H, K] fp32 (e^{G_end}); a/attn: [B, T, H, chunk] from
+    kkt_solve. Returns (o [B, T, H, V], ht)."""
+    ekb, kte, eq, mv, a, attn = (
+        x.contiguous() for x in (ekb, kte, eq, mv, a, attn)
     )
-    g_cs = g_cs.contiguous()
-    batch_size, num_tokens, Hg, K = q.shape
-    H, V = v.shape[2], v.shape[3]
+    gend = gend.contiguous()
+    batch_size, num_tokens, H, K = ekb.shape
+    V = mv.shape[3]
     chunk_size = a.shape[-1]
     assert K == 128 and V == 128
-    assert g_cs.dtype == torch.float32
+    assert gend.dtype == torch.float32
     if scale is None:
         scale = K**-0.5
 
     use_initial_state = initial_state is not None
     if initial_state is None:
         initial_state = torch.empty(
-            (batch_size, H, K, V), dtype=torch.float32, device=q.device
+            (batch_size, H, K, V), dtype=torch.float32, device=ekb.device
         )
     else:
         initial_state = initial_state.float().contiguous()
     o = torch.empty(
-        (batch_size, num_tokens, H, V), dtype=q.dtype, device=q.device
+        (batch_size, num_tokens, H, V), dtype=ekb.dtype, device=ekb.device
     )
     ht = torch.empty(
-        (batch_size, H, K, V), dtype=torch.float32, device=q.device
+        (batch_size, H, K, V), dtype=torch.float32, device=ekb.device
     )
     kernel = tilelang_fused_march_2(
         H,
-        Hg,
+        1,
         K,
         V,
         chunk_size,
         float(scale),
         accum_dtype="float32",
-        qkva_dtype=q.dtype,
-        g_dtype=g_cs.dtype,
+        qkva_dtype=ekb.dtype,
+        gend_dtype=gend.dtype,
         ht_dtype=torch.float32,
         o_dtype=o.dtype,
         use_initial_state=use_initial_state,
@@ -298,5 +268,5 @@ def fused_march_2(
         v_split=4,
     )
     num_chunks = tilelang.cdiv(num_tokens, chunk_size)
-    kernel(q, k, v, g_cs, b, w, a, attn, initial_state, o, ht, num_chunks)
+    kernel(ekb, kte, eq, mv, gend, a, attn, initial_state, o, ht, num_chunks)
     return o, (ht if output_final_state else None)
