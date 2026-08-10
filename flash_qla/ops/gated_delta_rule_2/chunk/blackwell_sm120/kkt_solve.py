@@ -233,8 +233,8 @@ def tilelang_kkt_solve_2(
             # The four 8x8 diagonals stay elementwise (no bounded factoring
             # exists inside a block) — 47% fewer pairs than 16x16 diagonals,
             # one exp2 feeding both grams, strip-unrolled channel loop.
-            for b8 in T.serial(4):
-                for j_s, j_t in T.Parallel(8, 8):
+            for b8, j_s, j_t in T.Parallel(4, 8, 8):
+                if True:
                     diag_local[0] = 0.0
                     diagq_local[0] = 0.0
                     if j_s >= j_t:
