@@ -19,7 +19,9 @@ import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARCH = sys.argv[1] if len(sys.argv) > 1 else "sm_120"
-TARGET = {"kind": "cuda", "arch": ARCH}
+# tilelang >= 0.1.13 wants dict-form targets with attributes; 0.1.9
+# only accepts the string form. Try both.
+TARGETS = ({"kind": "cuda", "arch": ARCH}, f"cuda -arch={ARCH}", "cuda")
 
 import tilelang  # noqa: E402
 
@@ -27,11 +29,16 @@ _orig_jit = tilelang.jit
 
 
 def _patched_jit(*args, **kwargs):
-    kwargs.setdefault("target", TARGET)
-    return _orig_jit(*args, **kwargs)
+    if "target" in kwargs:
+        return _orig_jit(*args, **kwargs)
+    def wrap(fn):
+        made = _orig_jit(*args, target=_TARGET[0], **kwargs)(fn)
+        return made
+    return wrap
 
 
 tilelang.jit = _patched_jit
+_TARGET = [TARGETS[0]]
 
 # The kernel modules import flash_qla.utils, whose package __init__ needs a
 # GPU; stub just what they use so the files load standalone.
@@ -41,6 +48,26 @@ fake_pkg = types.ModuleType("flash_qla")
 fake_pkg.utils = fake_utils
 sys.modules.setdefault("flash_qla", fake_pkg)
 sys.modules.setdefault("flash_qla.utils", fake_utils)
+
+
+def _pick_target():
+    import tilelang.language as T
+    for t in TARGETS:
+        try:
+            @_orig_jit(target=t)
+            def _mk():
+                @T.prim_func
+                def _k(x: T.Tensor((128,), "float32"),
+                       y: T.Tensor((128,), "float32")):
+                    with T.Kernel(1, threads=128) as (bx,):
+                        for i in T.Parallel(128):
+                            y[i] = x[i] * 2.0
+                return _k
+            _mk()
+            return t
+        except Exception:
+            continue
+    raise SystemExit("no usable target form for this tilelang")
 
 
 def load(relpath, name):
@@ -102,6 +129,8 @@ CASES = [
 
 
 def main():
+    _TARGET[0] = _pick_target()
+    print(f"target form: {_TARGET[0]}")
     failed = 0
     for name, path, factory_name, kwargs in CASES:
         try:
