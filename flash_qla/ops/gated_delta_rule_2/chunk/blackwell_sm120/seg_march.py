@@ -1,7 +1,13 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""Segment-parallel march for SM120: the sequence-split that removes the
-march's serial-chain bottleneck.
+"""Segment-parallel march for SM120: the sequence-split intended to
+remove the march's serial-chain bottleneck.
+
+PARKED, NOT WIRED: numerically sound, but ~10x slower per chunk step
+than the single-chain fused_march on SM120 — the per-step cost, not
+the chain length, dominates and the cause is unresolved (hoisting the
+range check out of the pipelined loop did not recover it). Kept for a
+future attempt; compare its generated CUDA against fused_march's.
 
 The chunk recurrence is AFFINE in the state, so a sequence split needs no
 bespoke correction machinery — the same kernel runs in three modes:

@@ -83,17 +83,10 @@ def _prepare_inputs(q, k, v, g, b, w, chunk_size):
     return prepare_inputs_2(q, k, v, g, b, w, chunk_size)
 
 _ARCH = tilelang.contrib.nvcc.get_target_compute_version()
-if _ARCH == "9.0":
-    from .hopper import kkt_solve
-    prepare_h_2 = None  # hopper port pending (sm120-first development)
-    fused_fwd_2 = None
-    fused_march_2 = None
-    gcs_2 = None
-    prepare_inputs_2b = None
-    prefold_gram_2 = None
-    seg_march_2 = None
-    CHUNK_SIZE_2 = 64
-elif _ARCH == "12.0":
+if _ARCH in ("9.0", "12.0"):
+    # These kernels are portable tilelang: no arch-specific intrinsics,
+    # so Hopper runs the same code. Chunk 64 / TMA / wider warp
+    # specialization are Hopper tuning opportunities, not requirements.
     from .blackwell_sm120 import kkt_solve
     from .blackwell_sm120.prepare_h import prepare_h_2
     from .blackwell_sm120.fused_fwd import fused_fwd_2
@@ -189,19 +182,11 @@ def chunk_gdn2(
         q, k, g, b, chunk_size=CHUNK_SIZE_2,
         do_l2norm=use_qk_l2norm_in_kernel,
     )
-    num_chunks = -(-q.shape[1] // CHUNK_SIZE_2)
-    segs = int(os.environ.get("FLASHQLA_SEGMENTS", "8"))
-    if segs > 1 and num_chunks >= 2 * segs:
-        o, ht = seg_march_2(
-            ekb, kte, eq, v, w, gend, a, attn, scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            num_segments=segs,
-        )
-    else:
-        o, ht = fused_march_2(
-            ekb, kte, eq, v, w, gend, a, attn, scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-        )
+    # The segmented march (seg_march.py) is parked: correct but ~10x
+    # slower than this single-chain kernel on SM120, cause unresolved.
+    o, ht = fused_march_2(
+        ekb, kte, eq, v, w, gend, a, attn, scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+    )
     return o, ht
