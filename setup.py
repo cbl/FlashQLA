@@ -26,8 +26,11 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.8",
-        "tilelang==0.1.9",
-        "apache-tvm-ffi==0.1.9",
+        # tilelang constrains apache-tvm-ffi itself (0.1.9 wants ~=0.1.0,
+        # 0.1.13 wants >=0.1.11,<0.1.13), so pinning either exactly here
+        # makes FlashQLA unresolvable next to any other tilelang release.
+        "tilelang>=0.1.9",
+        "apache-tvm-ffi>=0.1.9",
     ],
     zip_safe=False,
 )
